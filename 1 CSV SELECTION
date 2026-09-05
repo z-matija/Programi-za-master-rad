@@ -1,0 +1,529 @@
+"""
+ESM Database Filtering Tool - Advanced Interactive Version
+
+Author: [Your Full Name]
+Thesis: [Your Thesis Title]
+Date: [Current Date]
+
+Description:
+    This script provides an interactive filtering interface for the European 
+    Strong-Motion (ESM) flatfile database (SA.csv). It allows users to apply 
+    multiple selection criteria including magnitude, fault mechanism, site 
+    conditions (Vs30/EC8), distance metrics, and intensity measures (PGA/SA). 
+    The filtered subset is exported as a new CSV file, and all applied 
+    parameters are logged for transparency.
+
+Usage:
+    Run this script directly to launch the interactive command-line interface:
+        python esm_filter_interactive_advanced.py
+"""
+
+# --- Standard Library Imports ---
+import os
+import sys
+from datetime import datetime
+
+# --- Third-Party Imports ---
+import pandas as pd
+import numpy as np
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+def validate_columns(df, required_cols):
+    """
+    Check if required columns exist in the dataframe.
+    Returns list of missing columns.
+    """
+    missing = [col for col in required_cols if col not in df.columns]
+    return missing
+
+def filter_esm_dataframe(df, params):
+    """
+    Filters a loaded ESM SA DataFrame based on user parameters.
+    Each filter can be turned off by setting its value to None/empty list/False.
+    """
+    filtered_df = df.copy()
+    total_filters = 0
+    filters_applied = []
+    
+    print("\nApplying filters...")
+    print("-" * 60)
+    
+    # 1. Magnitude (Mw) - can be turned off by setting min/max to None
+    if params.get('min_magnitude') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['Mw'] >= params['min_magnitude']]
+        filters_applied.append(f"Mw ≥ {params['min_magnitude']}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    if params.get('max_magnitude') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['Mw'] <= params['max_magnitude']]
+        filters_applied.append(f"Mw ≤ {params['max_magnitude']}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 2. Fault Mechanism - turn off with empty list or None
+    fault_mechs = params.get('fault_mechanisms')
+    if fault_mechs and len(fault_mechs) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['fm_type_code'].isin(fault_mechs)]
+        filters_applied.append(f"Fault types {fault_mechs}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 3. EC8 Site Class - turn off with empty list or None
+    ec8_classes = params.get('ec8_classes')
+    if ec8_classes and len(ec8_classes) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['ec8_code'].isin(ec8_classes)]
+        filters_applied.append(f"EC8 classes {ec8_classes}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 4. Vs30 Range - turn off with None
+    if params.get('min_vs30') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['vs30_m_sec'] >= params['min_vs30']]
+        filters_applied.append(f"Vs30 ≥ {params['min_vs30']} m/s: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    if params.get('max_vs30') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['vs30_m_sec'] <= params['max_vs30']]
+        filters_applied.append(f"Vs30 ≤ {params['max_vs30']} m/s: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 5. Distance Metrics - choose which one to use
+    distance_metric = params.get('distance_metric', 'JB_dist')
+    min_dist = params.get('min_distance')
+    max_dist = params.get('max_distance')
+    
+    if distance_metric in filtered_df.columns:
+        if min_dist is not None:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df[distance_metric] >= min_dist]
+            filters_applied.append(f"{distance_metric} ≥ {min_dist} km: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+        
+        if max_dist is not None:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df[distance_metric] <= max_dist]
+            filters_applied.append(f"{distance_metric} ≤ {max_dist} km: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+    
+    # 6. Event Depth - turn off with None
+    if params.get('min_depth') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['ev_depth_km'] >= params['min_depth']]
+        filters_applied.append(f"Depth ≥ {params['min_depth']} km: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    if params.get('max_depth') is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['ev_depth_km'] <= params['max_depth']]
+        filters_applied.append(f"Depth ≤ {params['max_depth']} km: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 7. Instrument Type - turn off with empty list or None
+    instrument_types = params.get('instrument_type')
+    if instrument_types and len(instrument_types) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['instrument_type_code'].isin(instrument_types)]
+        filters_applied.append(f"Instrument type {instrument_types}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 8. Proximity Code - turn off with empty list or None
+    proximity_codes = params.get('proximity_codes')
+    if proximity_codes and len(proximity_codes) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['proximity_code'].isin(proximity_codes)]
+        filters_applied.append(f"Proximity codes {proximity_codes}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 9. Exclude Late Triggered - turn off with False
+    if params.get('exclude_late_triggered', False):
+        if 'late_triggered_flag_01' in filtered_df.columns:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df['late_triggered_flag_01'] != 1]
+            filters_applied.append(f"Exclude late triggered: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+    
+    # 10. PGA Filtering - turn off with None
+    pga_component = params.get('pga_component', 'RotD50')
+    pga_column = f"{pga_component}_pga"
+    
+    if pga_column in filtered_df.columns:
+        if params.get('min_pga') is not None:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df[pga_column] >= params['min_pga']]
+            filters_applied.append(f"PGA({pga_component}) ≥ {params['min_pga']} cm/s²: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+        
+        if params.get('max_pga') is not None:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df[pga_column] <= params['max_pga']]
+            filters_applied.append(f"PGA({pga_component}) ≤ {params['max_pga']} cm/s²: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+    
+    # 11. Country Filters - turn off with empty list or None
+    ev_countries = params.get('ev_nation_codes')
+    if ev_countries and len(ev_countries) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['ev_nation_code'].isin(ev_countries)]
+        filters_applied.append(f"Event countries {ev_countries}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    st_countries = params.get('st_nation_codes')
+    if st_countries and len(st_countries) > 0:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df[filtered_df['st_nation_code'].isin(st_countries)]
+        filters_applied.append(f"Station countries {st_countries}: -{initial_count - len(filtered_df)} records")
+        total_filters += 1
+    
+    # 12. Spectral Period Filtering - advanced option
+    target_period = params.get('target_period')
+    min_sa = params.get('min_sa')
+    sa_component = params.get('sa_component', 'RotD50')
+    
+    if target_period is not None and min_sa is not None:
+        # Convert period to column name (e.g., 1.0 -> "RotD50_T1_000")
+        period_str = str(target_period).replace('.', '_')
+        period_col = f"{sa_component}_T{period_str}"
+        
+        if period_col in filtered_df.columns:
+            initial_count = len(filtered_df)
+            filtered_df = filtered_df[filtered_df[period_col] >= min_sa]
+            filters_applied.append(f"SA({target_period}s) ≥ {min_sa} cm/s²: -{initial_count - len(filtered_df)} records")
+            total_filters += 1
+    
+    # 13. Max Records Per Event - turn off with None
+    max_records_per_event = params.get('max_records_per_event')
+    if max_records_per_event is not None:
+        initial_count = len(filtered_df)
+        filtered_df = filtered_df.groupby('event_id').head(max_records_per_event).reset_index(drop=True)
+        records_removed = initial_count - len(filtered_df)
+        filters_applied.append(f"Max {max_records_per_event} record(s) per event: -{records_removed} records")
+        total_filters += 1
+    
+    # Print summary of applied filters
+    print(f"\nTotal filters applied: {total_filters}")
+    for i, filter_desc in enumerate(filters_applied, 1):
+        print(f"  {i}. {filter_desc}")
+    
+    return filtered_df
+
+def interactive_parameter_adjustment(default_params):
+    """
+    Allow user to interactively adjust filter parameters.
+    Returns updated parameters.
+    """
+    print("\n" + "="*60)
+    print("INTERACTIVE PARAMETER SETUP")
+    print("="*60)
+    print("You can adjust each parameter or press Enter to keep default.")
+    print("To turn off a filter, type 'none', 'off', or leave empty for some.")
+    
+    params = default_params.copy()
+    
+    # Helper function for user input with defaults
+    def get_input(prompt, default, param_type='float'):
+        while True:
+            user_input = input(f"{prompt} [Default: {default}]: ").strip()
+            
+            if user_input.lower() in ['', 'none', 'off', 'skip']:
+                return None
+            
+            if user_input == '':
+                return default
+            
+            try:
+                if param_type == 'float':
+                    return float(user_input)
+                elif param_type == 'int':
+                    return int(user_input)
+                elif param_type == 'bool':
+                    return user_input.lower() in ['true', 'yes', 'y', '1']
+                elif param_type == 'list':
+                    # Parse comma-separated list
+                    items = [item.strip() for item in user_input.split(',')]
+                    return [item for item in items if item]
+                else:
+                    return user_input
+            except ValueError:
+                print(f"Invalid input. Please enter a valid {param_type} or 'none' to skip.")
+    
+    # Magnitude
+    print("\n--- Magnitude Filters ---")
+    params['min_magnitude'] = get_input("Minimum magnitude (Mw)", params['min_magnitude'], 'float')
+    params['max_magnitude'] = get_input("Maximum magnitude (Mw)", params['max_magnitude'], 'float')
+    
+    # Fault Mechanisms
+    print("\n--- Fault Mechanisms ---")
+    mechs_input = input(f"Fault types (comma-separated: SS,NF,TF,O,U) [Default: {','.join(params['fault_mechanisms'])}]: ").strip()
+    if mechs_input.lower() in ['none', 'off', 'skip', '']:
+        if mechs_input == '':
+            pass  # Keep default
+        else:
+            params['fault_mechanisms'] = []
+    elif mechs_input:
+        params['fault_mechanisms'] = [m.strip() for m in mechs_input.split(',')]
+    
+    # Site Conditions
+    print("\n--- Site Conditions ---")
+    ec8_input = input(f"EC8 classes (comma-separated: A,B,C,D,E) [Default: {','.join(params['ec8_classes'])}]: ").strip()
+    if ec8_input.lower() in ['none', 'off', 'skip', '']:
+        if ec8_input == '':
+            pass  # Keep default
+        else:
+            params['ec8_classes'] = []
+    elif ec8_input:
+        params['ec8_classes'] = [c.strip() for c in ec8_input.split(',')]
+    
+    params['min_vs30'] = get_input("Minimum Vs30 (m/s)", params['min_vs30'], 'float')
+    params['max_vs30'] = get_input("Maximum Vs30 (m/s)", params['max_vs30'], 'float')
+    
+    # Distance
+    print("\n--- Distance Filters ---")
+    print("Available distance metrics: JB_dist, epi_dist, rup_dist, Rx_dist, Ry0_dist")
+    distance_metric = input(f"Distance metric [Default: {params['distance_metric']}]: ").strip()
+    if distance_metric and distance_metric.lower() not in ['none', 'off', 'skip']:
+        params['distance_metric'] = distance_metric
+    
+    params['min_distance'] = get_input(f"Minimum {params['distance_metric']} (km)", params['min_distance'], 'float')
+    params['max_distance'] = get_input(f"Maximum {params['distance_metric']} (km)", params['max_distance'], 'float')
+    
+    # Event Depth
+    print("\n--- Event Depth ---")
+    params['min_depth'] = get_input("Minimum depth (km)", params['min_depth'], 'float')
+    params['max_depth'] = get_input("Maximum depth (km)", params['max_depth'], 'float')
+    
+    # Instrument & Recording
+    print("\n--- Instrument & Recording ---")
+    inst_input = input(f"Instrument types (D=digital, A=analog, U=unknown) [Default: {','.join(params['instrument_type'])}]: ").strip()
+    if inst_input.lower() in ['none', 'off', 'skip', '']:
+        if inst_input == '':
+            pass
+        else:
+            params['instrument_type'] = []
+    elif inst_input:
+        params['instrument_type'] = [i.strip() for i in inst_input.split(',')]
+    
+    params['exclude_late_triggered'] = get_input("Exclude late triggered? (yes/no)", params['exclude_late_triggered'], 'bool')
+    
+    # PGA Filtering
+    print("\n--- PGA Filtering ---")
+    print("Available components: RotD50, RotD100, RotD00, U, V, W")
+    pga_comp = input(f"PGA component [Default: {params['pga_component']}]: ").strip()
+    if pga_comp and pga_comp.lower() not in ['none', 'off', 'skip']:
+        params['pga_component'] = pga_comp
+    
+    params['min_pga'] = get_input("Minimum PGA (cm/s²)", params['min_pga'], 'float')
+    params['max_pga'] = get_input("Maximum PGA (cm/s²)", params['max_pga'], 'float')
+    
+    # Spectral Filtering (Advanced)
+    print("\n--- Spectral Acceleration Filtering (Optional) ---")
+    use_sa = input("Filter by spectral acceleration at specific period? (yes/no): ").strip().lower()
+    if use_sa in ['yes', 'y']:
+        params['target_period'] = get_input("Target period (s) [e.g., 0.3, 1.0, 3.0]", None, 'float')
+        if params['target_period'] is not None:
+            params['min_sa'] = get_input(f"Minimum SA at {params['target_period']}s (cm/s²)", 0, 'float')
+    
+    # Records per Event
+    print("\n--- Records per Event ---")
+    params['max_records_per_event'] = get_input("Maximum records per event (set to 1 for backbone curves)", params['max_records_per_event'], 'int')
+    
+    return params
+
+def main():
+    print("\n" + "="*70)
+    print("ESM DATABASE FILTERING TOOL - ADVANCED VERSION")
+    print("="*70)
+    
+    # --- 1. INTERACTIVE PATH INPUT ---
+    print("\nSTEP 1: Locate your ESM 'SA.csv' file.")
+    print("Tip: You can drag and drop the file into the terminal.")
+    csv_path = input("Please enter the FULL PATH to 'ESM_flatfile_SA.csv': ").strip()
+    
+    # Remove quotes if user pastes a path with them
+    csv_path = csv_path.strip('"').strip("'")
+    
+    # --- 2. VALIDATE THE PATH ---
+    if not os.path.isfile(csv_path):
+        print(f"\n ERROR: File not found at: {csv_path}")
+        print("Please check the path and try again.")
+        return
+    
+    file_size = os.path.getsize(csv_path) / (1024**3)  # Size in GB
+    print(f" File found: {os.path.basename(csv_path)} ({file_size:.2f} GB)")
+    
+    # --- 3. DEFINE DEFAULT FILTER PARAMETERS ---
+    print("\nSTEP 2: Setting up filter parameters...")
+    
+    # DEFAULT PARAMETERS (can be turned off individually)
+    default_params = {
+        # Magnitude (turn off by setting to None)
+        'min_magnitude': 4.5,
+        'max_magnitude': 7.5,
+        
+        # Fault mechanisms (turn off by setting to empty list [])
+        'fault_mechanisms': ['SS', 'NF', 'O'],
+        
+        # Site conditions (turn off by setting to empty list or None)
+        'ec8_classes': ['A', 'B'],  # Multiple classes allowed
+        'min_vs30': 180,  # m/s (EC8 Class C lower bound)
+        'max_vs30': 1500,  # m/s
+        
+        # Distance metrics
+        'distance_metric': 'JB_dist',  # Options: JB_dist, epi_dist, rup_dist, Rx_dist, Ry0_dist
+        'min_distance': 20,  # km (turn off with None)
+        'max_distance': 100,  # km (turn off with None)
+        
+        # Event characteristics
+        'min_depth': 0,  # km
+        'max_depth': 30,  # km
+        
+        # Instrument & recording quality
+        'instrument_type': ['D'],  # Digital only (turn off with empty list)
+        'exclude_late_triggered': True,  # Turn off with False
+        
+        # Intensity measures
+        'pga_component': 'RotD50',  # Component for PGA filtering
+        'min_pga': 10,  # cm/s² (~0.01g)
+        'max_pga': 1000,  # cm/s² (~1.0g)
+        
+        # Spectral filtering (advanced - usually turned off)
+        'target_period': None,  # Period for SA filtering (s)
+        'min_sa': None,  # Minimum SA at target period
+        'sa_component': 'RotD50',  # Component for SA
+        
+        # Country filters (usually turned off)
+        'ev_nation_codes': [],  # Event country codes (ISO)
+        'st_nation_codes': [],  # Station country codes
+        
+        # Records per event (turn off with None)
+        'max_records_per_event': 3,
+    }
+    
+    # --- 4. INTERACTIVE PARAMETER ADJUSTMENT ---
+    print("\nDo you want to adjust the filter parameters interactively?")
+    adjust = input("(yes/no) [Default: yes]: ").strip().lower()
+    
+    if adjust in ['', 'yes', 'y']:
+        filter_params = interactive_parameter_adjustment(default_params)
+    else:
+        filter_params = default_params
+        print("\nUsing default filter parameters:")
+        for key, value in filter_params.items():
+            if value is not None and value != [] and value != {} and value != '':
+                print(f"  - {key}: {value}")
+    
+    # --- 5. LOAD THE CSV ---
+    print("\nSTEP 3: Loading CSV (this may take a moment for large files)...")
+    try:
+        # Load with progress indicator
+        print("Loading...", end='', flush=True)
+        df_full = pd.read_csv(csv_path, delimiter=';', low_memory=False)
+        print(f" Successfully loaded {len(df_full):,} total records.")
+        
+        # Check required columns
+        required_cols = ['event_id', 'Mw', 'fm_type_code', 'JB_dist', 'vs30_m_sec']
+        missing = validate_columns(df_full, required_cols)
+        if missing:
+            print(f"\n  WARNING: Missing expected columns: {missing}")
+            print("Some filters may not work correctly.")
+            proceed = input("Continue anyway? (yes/no): ").strip().lower()
+            if proceed not in ['yes', 'y']:
+                return
+    except Exception as e:
+        print(f"\n ERROR loading CSV: {e}")
+        print("Possible issues: Wrong delimiter, file corruption, or memory limits.")
+        return
+    
+    # --- 6. APPLY FILTERS ---
+    df_filtered = filter_esm_dataframe(df_full, filter_params)
+    
+    if len(df_filtered) == 0:
+        print("\n  WARNING: No records matched all filters!")
+        print("Consider broadening your criteria or turning off some filters.")
+        
+        # Show which filters removed all records
+        print("\nTry turning off these filters one by one:")
+        for key, value in filter_params.items():
+            if value not in [None, [], {}, '', 0, False]:
+                print(f"  - {key}: {value}")
+        return
+    
+    # --- 7. SAVE RESULTS ---
+    print("\nSTEP 4: Saving filtered subset...")
+    
+    # Create descriptive filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    input_dir = os.path.dirname(csv_path)
+    output_filename = f"ESM_Filtered_{timestamp}.csv"
+    output_path = os.path.join(input_dir, output_filename)
+    
+    # Save to CSV
+    df_filtered.to_csv(output_path, index=False)
+    print(f" Saved {len(df_filtered):,} records to:\n   {output_path}")
+    
+    # Save filter parameters as metadata
+    param_filename = f"ESM_Filter_Params_{timestamp}.txt"
+    param_path = os.path.join(input_dir, param_filename)
+    
+    with open(param_path, 'w') as f:
+        f.write(f"ESM Filter Parameters - {timestamp}\n")
+        f.write("="*50 + "\n")
+        for key, value in filter_params.items():
+            f.write(f"{key}: {value}\n")
+    
+    print(f" Filter parameters saved to: {param_path}")
+    
+    # --- 8. FINAL SUMMARY ---
+    print("\n" + "="*70)
+    print("FILTERING COMPLETE - SUMMARY")
+    print("="*70)
+    print(f"Original records: {len(df_full):,}")
+    print(f"Filtered records: {len(df_filtered):,}")
+    print(f"Reduction: {100*(1 - len(df_filtered)/len(df_full)):.1f}%")
+    
+    if len(df_filtered) > 0:
+        print("\n Key statistics of filtered set:")
+        print(f"  Magnitude (Mw): {df_filtered['Mw'].min():.1f} to {df_filtered['Mw'].max():.1f}")
+        print(f"  Vs30: {df_filtered['vs30_m_sec'].min():.0f} to {df_filtered['vs30_m_sec'].max():.0f} m/s")
+        print(f"  Distance ({filter_params.get('distance_metric', 'JB_dist')}): "
+              f"{df_filtered[filter_params.get('distance_metric', 'JB_dist')].min():.0f} to "
+              f"{df_filtered[filter_params.get('distance_metric', 'JB_dist')].max():.0f} km")
+        print(f"  Depth: {df_filtered['ev_depth_km'].min():.0f} to {df_filtered['ev_depth_km'].max():.0f} km")
+        
+        # Unique values in key columns
+        if 'fm_type_code' in df_filtered.columns:
+            fault_types = df_filtered['fm_type_code'].unique()
+            print(f"  Fault types: {sorted(fault_types)}")
+        
+        if 'ec8_code' in df_filtered.columns:
+            ec8_classes = df_filtered['ec8_code'].unique()
+            print(f"  EC8 classes: {sorted(ec8_classes)}")
+        
+        if 'instrument_type_code' in df_filtered.columns:
+            inst_types = df_filtered['instrument_type_code'].unique()
+            print(f"  Instrument types: {sorted(inst_types)}")
+        
+        # Number of unique events
+        unique_events = df_filtered['event_id'].nunique()
+        print(f"\n Dataset composition:")
+        print(f"  Unique events: {unique_events}")
+        print(f"  Records per event (avg): {len(df_filtered)/unique_events:.1f}")
+        
+        # Preview
+        print(f"\n First 5 record identifiers (event_id - station_code):")
+        for i, (ev, st) in enumerate(zip(df_filtered['event_id'].head(5), df_filtered['station_code'].head(5))):
+            print(f"  {i+1}. {ev} - {st}")
+    
+    print("\n" + "="*70)
+    print("Next steps:")
+    print("1. Check the filtered dataset for your research needs")
+    print("2. Adjust filters and rerun if needed")
+    print("3. Use the parameters file to reproduce the filtering")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
