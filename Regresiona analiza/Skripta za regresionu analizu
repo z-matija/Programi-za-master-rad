@@ -1,1 +1,774 @@
+#!/usr/bin/env python3
+"""
+Wall Power Law Regression Analysis with Full Statistical Output
 
+Description:
+    This script performs power law regression analysis (EDP = a * IM^b) on
+    wall displacement data and intensity measure data. It fits the model via
+    OLS on log-log transformed data and outputs coefficients, R² (log and
+    original), dispersion, standard errors, confidence intervals, t-statistics,
+    and p-values. It includes JSON configuration persistence, R² heatmaps,
+    dispersion (σ) heatmaps, and comparative plots per intensity measure.
+
+    Input files must be named Z1.xlsx, Z2.xlsx, ... Zn.xlsx in both the
+    displacement and IM folders. The user specifies the per-wall column
+    letter for displacement values.
+"""
+
+# --- Standard Library Imports ---
+import os
+import warnings
+import json
+import glob
+from datetime import datetime
+
+# --- Third-Party Imports ---
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+# ----------------------------------------------------------------------
+# Constants and style
+# ----------------------------------------------------------------------
+MARKERS = ['^', 's', '+', 'o', 'v', '<', '>', 'p', '*', 'x', 'D', 'h']
+LINE_STYLES = ['-', '--', '-.', ':']
+COLOR = 'black'
+CONFIG_FILENAME = "powerlaw_config.json"
+
+def get_config_dir():
+    """Return the directory where the config file should be stored."""
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+def get_config_path():
+    return os.path.join(get_config_dir(), CONFIG_FILENAME)
+
+# ----------------------------------------------------------------------
+# Input helper functions
+# ----------------------------------------------------------------------
+def get_float_input(prompt, default_value=None):
+    while True:
+        user_input = input(prompt).strip()
+        if not user_input and default_value is not None:
+            return default_value
+        try:
+            return float(user_input)
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+def get_column_letter_input(prompt):
+    while True:
+        col_letter = input(prompt).strip().upper()
+        if len(col_letter) == 1 and col_letter.isalpha():
+            return col_letter
+        else:
+            print("Invalid input. Please enter a single letter (e.g., 'A').")
+
+def get_int_input(prompt):
+    while True:
+        user_input = input(prompt).strip()
+        try:
+            return int(user_input)
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
+
+def get_yes_no_input(prompt):
+    while True:
+        user_input = input(prompt).strip().lower()
+        if user_input in ['y', 'yes']:
+            return True
+        elif user_input in ['n', 'no']:
+            return False
+        else:
+            print("Invalid input. Please enter 'y' or 'n'.")
+
+def get_directory_path(prompt):
+    while True:
+        raw = input(prompt).strip().strip('"')
+        if os.path.isdir(raw):
+            return raw
+        else:
+            print(f"Directory not found: {raw}")
+            print("Please enter a valid directory path.")
+
+def get_file_extension_agnostic_path(folder, basename):
+    """Return the full path of a file (basename.xlsx or basename.xls) if exists."""
+    for ext in ['.xlsx', '.xls']:
+        path = os.path.join(folder, basename + ext)
+        if os.path.isfile(path):
+            return path
+    return None
+
+# ----------------------------------------------------------------------
+# Configuration save/load (adapted for folder-based inputs)
+# ----------------------------------------------------------------------
+def save_config(config):
+    config_path = get_config_path()
+    # Remove large data like full file lists, keep only essential settings
+    save_copy = {
+        'y_type': config['y_type'],
+        'use_log_y': config['use_log_y'],
+        'use_log_x': config['use_log_x'],
+        'drift_limit': config['drift_limit'],
+        'reference_drift_limit': config['reference_drift_limit'],
+        'num_walls': config['num_walls'],
+        'floor_height': config.get('floor_height'),
+        'displacement_folder': config.get('displacement_folder'),
+        'im_folder': config.get('im_folder'),
+        'walls': []  # only names and column letters
+    }
+    for w in config['walls']:
+        save_copy['walls'].append({
+            'name': w['name'],
+            'y_col': w['y_col'],
+            'file_index': w['file_index']
+        })
+    with open(config_path, 'w') as f:
+        json.dump(save_copy, f, indent=2)
+    print(f"Configuration saved to {config_path}")
+
+def load_config():
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, 'r') as f:
+            saved = json.load(f)
+        required = ['y_type', 'use_log_y', 'use_log_x', 'drift_limit',
+                    'reference_drift_limit', 'num_walls', 'walls']
+        if all(k in saved for k in required):
+            return saved
+        else:
+            print("Config file missing required fields. Ignoring.")
+            return None
+    except Exception as e:
+        print(f"Error loading config: {e}. Ignoring.")
+        return None
+
+def confirm_section(section_name, current_value, display_func=None):
+    if display_func:
+        display_func(current_value)
+    else:
+        print(f"{section_name}: {current_value}")
+    return get_yes_no_input(f"Keep this {section_name}? (y/n): ")
+
+# ----------------------------------------------------------------------
+# Interactive input collection (new folder-based version)
+# ----------------------------------------------------------------------
+def get_all_inputs(use_saved_config=False):
+    config = {}
+    if use_saved_config:
+        saved = load_config()
+        if saved is None:
+            print("No valid saved configuration found. Falling back to interactive mode.")
+            use_saved_config = False
+
+    if not use_saved_config:
+        print("\n" + "="*60)
+        print("WALL POWER LAW REGRESSION WITH FULL STATISTICS (FOLDER MODE)")
+        print("="*60)
+
+        print("Please select the type of Y-values:")
+        print("1. Maximal relative displacement (will be divided by floor height)")
+        print("2. Average relative displacement (used as-is)")
+        print("3. Max relative displacement for the last floor (will be divided by wall height)")
+        y_type = 0
+        while y_type not in [1,2,3]:
+            y_type = get_int_input("Enter your choice (1, 2, or 3): ")
+        config['y_type'] = y_type
+
+        config['use_log_y'] = get_yes_no_input("\nUse logarithmic scale for Y-axis? (y/n, recommended=y): ")
+        config['use_log_x'] = get_yes_no_input("Use logarithmic scale for X-axis? (y/n, recommended=y): ")
+
+        print("\n" + "="*60)
+        print("DRIFT LIMIT SETTING")
+        print("="*60)
+        config['drift_limit'] = get_float_input("\nEnter maximum drift to include in analysis (%) [2.0]: ", 2.0)
+        config['reference_drift_limit'] = get_float_input("Enter drift limit for reference line in % (default: 2.0): ", 2.0)
+
+        # New: number of walls
+        num_walls = get_int_input("\nHow many walls would you like to analyze? ")
+        config['num_walls'] = num_walls
+
+        # Floor height (used only for Y-type 1 or 3)
+        floor_height = 1.0
+        if y_type in [1, 3]:
+            floor_height = get_float_input("Floor / wall height (meters) – same for all walls: ")
+        config['floor_height'] = floor_height
+
+        # Folders
+        print("\n--- Displacement files folder ---")
+        disp_folder = get_directory_path("Folder containing displacement Excel files (named Z1.xlsx, Z2.xlsx, ...): ")
+        config['displacement_folder'] = disp_folder
+
+        print("\n--- Intensity measure files folder ---")
+        im_folder = get_directory_path("Folder containing IM Excel files (same naming Z1.xlsx, Z2.xlsx, ...): ")
+        config['im_folder'] = im_folder
+
+        # Per-wall inputs
+        walls = []
+        for i in range(1, num_walls + 1):
+            default_name = f"Z{i}"
+            print(f"\n--- Wall {i} (file base: {default_name}) ---")
+            name = input(f"Name for this wall (or press Enter to use '{default_name}'): ").strip()
+            if not name:
+                name = default_name
+            y_col = get_column_letter_input(f"Column letter for displacement values in {default_name}.xlsx: ")
+            walls.append({
+                "name": name,
+                "y_col": y_col,
+                "file_index": i
+            })
+        config['walls'] = walls
+
+        save_config(config)
+        return config
+
+    # Use saved config with confirmation
+    saved = saved  # from earlier
+    config = saved
+    print("\n" + "="*60)
+    print("LOADED PREVIOUS CONFIGURATION")
+    print("="*60)
+
+    def disp_ytype(v):
+        type_desc = {1: "Max relative displacement / height",
+                     2: "Average relative displacement (as-is)",
+                     3: "Max relative displacement for last floor / height"}
+        print(f"Y-value type: {v} ({type_desc.get(v, '')})")
+    if not confirm_section("Y-type", config['y_type'], disp_ytype):
+        y_type = 0
+        while y_type not in [1,2,3]:
+            y_type = get_int_input("Enter your choice (1, 2, or 3): ")
+        config['y_type'] = y_type
+
+    if not confirm_section("Log Y-axis", config['use_log_y']):
+        config['use_log_y'] = get_yes_no_input("Use logarithmic scale for Y-axis? (y/n): ")
+    if not confirm_section("Log X-axis", config['use_log_x']):
+        config['use_log_x'] = get_yes_no_input("Use logarithmic scale for X-axis? (y/n): ")
+
+    if not confirm_section("Maximum drift limit (%)", config['drift_limit']):
+        config['drift_limit'] = get_float_input("Enter maximum drift to include in analysis (%) : ")
+    if not confirm_section("Reference drift limit (%)", config['reference_drift_limit']):
+        config['reference_drift_limit'] = get_float_input("Enter drift limit for reference line in % : ")
+
+    if not confirm_section("Number of walls", config['num_walls']):
+        config['num_walls'] = get_int_input("How many walls? ")
+    if not confirm_section("Floor/ wall height", config.get('floor_height', 1.0)):
+        if config['y_type'] in [1,3]:
+            config['floor_height'] = get_float_input("Enter floor/wall height (meters): ")
+        else:
+            config['floor_height'] = 1.0
+
+    if not confirm_section("Displacement folder", config['displacement_folder']):
+        config['displacement_folder'] = get_directory_path("Folder with displacement files: ")
+    if not confirm_section("IM folder", config['im_folder']):
+        config['im_folder'] = get_directory_path("Folder with IM files: ")
+
+    if not confirm_section("Walls configuration", f"{len(config['walls'])} wall(s)"):
+        walls = []
+        for i in range(1, config['num_walls'] + 1):
+            default_name = f"Z{i}"
+            print(f"\n--- Wall {i} (file base: {default_name}) ---")
+            name = input(f"Name (Enter for '{default_name}'): ").strip()
+            if not name:
+                name = default_name
+            y_col = get_column_letter_input(f"Column letter for displacement in {default_name}.xlsx: ")
+            walls.append({"name": name, "y_col": y_col, "file_index": i})
+        config['walls'] = walls
+    else:
+        # verify that all saved wall files still exist in the folders
+        updated_walls = []
+        for w in config['walls']:
+            idx = w['file_index']
+            disp_path = get_file_extension_agnostic_path(config['displacement_folder'], f"Z{idx}")
+            im_path = get_file_extension_agnostic_path(config['im_folder'], f"Z{idx}")
+            if disp_path is None:
+                print(f"Warning: displacement file Z{idx} not found in {config['displacement_folder']}")
+            if im_path is None:
+                print(f"Warning: IM file Z{idx} not found in {config['im_folder']}")
+            updated_walls.append(w)
+        config['walls'] = updated_walls
+
+    save_config(config)
+    return config
+
+# ----------------------------------------------------------------------
+# Data filtering (unchanged)
+# ----------------------------------------------------------------------
+def filter_data_for_power_law(X, Y, wall_name, intensity_name, drift_limit_ratio=None):
+    total_count = len(X)
+    zero_x_indices = np.where(X <= 0)[0]
+    zero_y_indices = np.where(Y <= 0)[0]
+    nan_x_indices = np.where(np.isnan(X))[0]
+    nan_y_indices = np.where(np.isnan(Y))[0]
+
+    valid_mask = (X > 0) & (Y > 0) & (~np.isnan(X)) & (~np.isnan(Y))
+    if drift_limit_ratio is not None:
+        exceed_drift_indices = np.where(Y > drift_limit_ratio)[0]
+        valid_mask = valid_mask & (Y <= drift_limit_ratio)
+    else:
+        exceed_drift_indices = np.array([])
+
+    X_filtered = X[valid_mask]
+    Y_filtered = Y[valid_mask]
+
+    removed_stats = {
+        'total_original': total_count,
+        'total_filtered': len(X_filtered),
+        'removed_total': total_count - len(X_filtered),
+        'removed_zero_x': len(zero_x_indices),
+        'removed_zero_y': len(zero_y_indices),
+        'removed_nan_x': len(nan_x_indices),
+        'removed_nan_y': len(nan_y_indices),
+        'removed_exceed_drift': len(exceed_drift_indices) if drift_limit_ratio is not None else 0,
+        'drift_limit_applied': drift_limit_ratio is not None
+    }
+
+    warning_msg = ""
+    if removed_stats['removed_total'] > 0:
+        warning_msg = f"\n WARNING: {removed_stats['removed_total']} of {total_count} data points removed for {intensity_name}:\n"
+        if len(zero_x_indices) > 0:
+            warning_msg += f" - X ≤ 0: {len(zero_x_indices)} point(s)\n"
+        if len(zero_y_indices) > 0:
+            warning_msg += f" - Y ≤ 0: {len(zero_y_indices)} point(s)\n"
+        if removed_stats['drift_limit_applied'] and len(exceed_drift_indices) > 0:
+            warning_msg += f" - Y > {drift_limit_ratio*100:.1f}%: {len(exceed_drift_indices)} point(s)\n"
+        if len(nan_x_indices) > 0:
+            warning_msg += f" - X is NaN: {len(nan_x_indices)} point(s)\n"
+        if len(nan_y_indices) > 0:
+            warning_msg += f" - Y is NaN: {len(nan_y_indices)} point(s)\n"
+        warning_msg += f" Remaining for regression: {len(X_filtered)} points\n"
+    return X_filtered, Y_filtered, warning_msg, removed_stats, total_count
+
+# ----------------------------------------------------------------------
+# Power law fitting (unchanged)
+# ----------------------------------------------------------------------
+def fit_power_law_with_stats(X, Y):
+    mask = (X > 0) & (Y > 0)
+    X = X[mask]
+    Y = Y[mask]
+    n = len(X)
+    if n < 2:
+        return (None,) * 18
+
+    log_X = np.log(X)
+    log_Y = np.log(Y)
+
+    model = LinearRegression()
+    model.fit(log_X.reshape(-1, 1), log_Y)
+    b = model.coef_[0]
+    ln_a = model.intercept_
+    a = np.exp(ln_a)
+
+    log_Y_pred = model.predict(log_X.reshape(-1, 1))
+    Y_pred_orig = a * (X ** b)
+
+    r2_log = model.score(log_X.reshape(-1, 1), log_Y)
+    r2_orig = r2_score(Y, Y_pred_orig)
+
+    residuals_log = log_Y - log_Y_pred
+    SSE_log = np.sum(residuals_log ** 2)
+    sigma = np.sqrt(SSE_log / (n - 2))
+
+    X_bar = np.mean(log_X)
+    Sxx = np.sum((log_X - X_bar) ** 2)
+    se_b = sigma / np.sqrt(Sxx)
+    se_ln_a = sigma * np.sqrt(1.0/n + (X_bar**2)/Sxx)
+
+    t_b0 = b / se_b
+    t_b1 = (b - 1) / se_b
+    df = n - 2
+    p_b0 = 2 * stats.t.sf(abs(t_b0), df)
+    p_b1 = 2 * stats.t.sf(abs(t_b1), df)
+
+    alpha = 0.05
+    t_crit = stats.t.ppf(1 - alpha/2, df)
+    ci_b = (b - t_crit * se_b, b + t_crit * se_b)
+    ci_ln_a = (ln_a - t_crit * se_ln_a, ln_a + t_crit * se_ln_a)
+    ci_a = (np.exp(ci_ln_a[0]), np.exp(ci_ln_a[1]))
+    factor = np.exp(sigma)
+
+    return (a, b, r2_log, r2_orig, sigma, factor,
+            se_b, se_ln_a, ci_b, ci_a,
+            t_b0, t_b1, p_b0, p_b1,
+            residuals_log, Y_pred_orig, n, df)
+
+def interpret_exponent(b):
+    if abs(b - 1.0) < 0.1:
+        return "approximately linear response"
+    elif b > 1.1:
+        return "super-linear response (b > 1)"
+    elif b < 0.9:
+        return "sub-linear response (b < 1)"
+    else:
+        return "near-linear response"
+
+# ----------------------------------------------------------------------
+# Plotting functions (unchanged except for small adaptation)
+# ----------------------------------------------------------------------
+def create_individual_plot(wall_name, header, X_valid, Y_valid, a, b, r2_log, r2_orig, sigma,
+                           total_count, filtered_count, drift_limit_ratio, reference_drift_limit,
+                           use_log_x, use_log_y, wall_marker, output_dir):
+    plt.figure(figsize=(14, 10))
+    plt.scatter(X_valid, Y_valid, marker=wall_marker, color=COLOR, alpha=0.7, s=30,
+                label='Data points')
+    x_plot = np.linspace(X_valid.min(), X_valid.max(), 300)
+    y_plot = a * (x_plot ** b)
+    plt.plot(x_plot, y_plot, color=COLOR, linestyle='-', linewidth=1.5,
+             label=f'Power law: y = {a:.4f} x^{b:.3f}')
+    plt.axhline(y=reference_drift_limit/100, color=COLOR, linestyle=(0, (3,3)), linewidth=2,
+                label=f'Reference drift limit ({reference_drift_limit}%)')
+    if drift_limit_ratio is not None:
+        plt.axhline(y=drift_limit_ratio, color='red', linestyle=(0, (5,2,1,2)), linewidth=2, alpha=0.7,
+                    label=f'Analysis drift limit ({drift_limit_ratio*100:.1f}%)')
+    if use_log_y:
+        plt.yscale('log')
+    if use_log_x:
+        plt.xscale('log')
+    plt.xlabel(header + (' (log scale)' if use_log_x else ''))
+    plt.ylabel('Drift ratio' + (' (log scale)' if use_log_y else ''))
+    plt.title(f'{wall_name} - {header} (Power law)')
+    ann_text = (f'$a = {a:.4f}$, $b = {b:.3f}$\n'
+                f'$R^2_{{log}} = {r2_log:.3f}$, $R^2_{{orig}} = {r2_orig:.3f}$\n'
+                f'$\\sigma = {sigma:.3f}$, $e^{{\\sigma}} = {np.exp(sigma):.3f}$\n'
+                f'Points: {filtered_count}/{total_count}')
+    plt.text(0.02, 0.98, ann_text, transform=plt.gca().transAxes,
+             fontsize=10, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    plt.legend(fontsize=10, loc='best')
+    plt.grid(True, alpha=0.3)
+    safe_header = "".join(c for c in header if c.isalnum() or c in (' ', '_')).rstrip()
+    safe_wall_name = "".join(c for c in wall_name if c.isalnum() or c in (' ', '_')).rstrip()
+    scale_suffix = ""
+    if use_log_x and use_log_y:
+        scale_suffix = "_log_log"
+    elif use_log_x:
+        scale_suffix = "_log_x"
+    elif use_log_y:
+        scale_suffix = "_log_y"
+    filename = os.path.join(output_dir, f"{safe_wall_name}_{safe_header}_powerlaw{scale_suffix}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_comparative_plot(header, walls_data, all_wall_names, wall_markers, wall_line_styles,
+                            use_log_x, use_log_y, drift_limit_ratio, reference_drift_limit,
+                            y_type_label, output_dir):
+    plt.figure(figsize=(14, 10))
+    plotted = False
+    for wall_name in all_wall_names:
+        if wall_name not in walls_data or header not in walls_data[wall_name]:
+            continue
+        wdata = walls_data[wall_name][header]
+        X = wdata['X_filtered']
+        Y = wdata['Y_filtered']
+        a = wdata['a']
+        b = wdata['b']
+        r2_log = wdata['r2_log']
+        n_used = wdata['n_used']
+        n_total = wdata['n_total']
+        plt.scatter(X, Y, marker=wall_markers[wall_name], color=COLOR, alpha=0.7, s=30,
+                    label=f'{wall_name} ({n_used}/{n_total} points)')
+        x_plot = np.linspace(X.min(), X.max(), 300)
+        y_plot = a * (x_plot ** b)
+        plt.plot(x_plot, y_plot, color=COLOR, linestyle=wall_line_styles[wall_name],
+                 linewidth=1.5, label=f'{wall_name}: y={a:.3f} x^{b:.3f} (R²_log={r2_log:.3f})')
+        plotted = True
+    if not plotted:
+        return
+    plt.axhline(y=reference_drift_limit/100, color=COLOR, linestyle=(0, (3,3)), linewidth=2,
+                label=f'Reference drift limit ({reference_drift_limit}%)')
+    if drift_limit_ratio is not None:
+        plt.axhline(y=drift_limit_ratio, color='red', linestyle=(0, (5,2,1,2)), linewidth=2, alpha=0.7,
+                    label=f'Analysis drift limit ({drift_limit_ratio*100:.1f}%)')
+    if use_log_y:
+        plt.yscale('log')
+    if use_log_x:
+        plt.xscale('log')
+    plt.xlabel(header + (' (log scale)' if use_log_x else ''))
+    plt.ylabel(y_type_label + (' (log scale)' if use_log_y else ''))
+    plt.title(f'Comparative Analysis: {header} (Power Law)')
+    plt.legend(fontsize=9, loc='best')
+    plt.grid(True, alpha=0.3)
+    safe_header = "".join(c for c in header if c.isalnum() or c in (' ', '_')).rstrip()
+    scale_suffix = ""
+    if use_log_x and use_log_y:
+        scale_suffix = "_log_log"
+    elif use_log_x:
+        scale_suffix = "_log_x"
+    elif use_log_y:
+        scale_suffix = "_log_y"
+    filename = os.path.join(output_dir, f"comparative_{safe_header}_powerlaw{scale_suffix}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_heatmap(data_matrix, row_labels, col_labels, title, filename, vmin=None, vmax=None,
+                   cmap='RdYlGn', annot=True, fmt='.3f'):
+    if data_matrix.size == 0:
+        print(f"  Warning: No data for heatmap {title}")
+        return
+    n_rows, n_cols = data_matrix.shape
+    cell_size = 0.8
+    fig_width = max(10, n_cols * cell_size + 2)
+    fig_height = max(8, n_rows * cell_size + 1.5)
+    plt.figure(figsize=(fig_width, fig_height))
+    mask = np.isnan(data_matrix)
+    ax = sns.heatmap(data_matrix, annot=annot, fmt=fmt, cmap=cmap, mask=mask,
+                     vmin=vmin, vmax=vmax, linewidths=2, linecolor='white',
+                     square=True, cbar_kws={'label': title, 'shrink': 0.8},
+                     annot_kws={'size': 10, 'weight': 'bold', 'color': 'black'})
+    ax.set_xlabel('Walls', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Intensity Measures', fontsize=13, fontweight='bold')
+    ax.set_title(title, fontsize=15, fontweight='bold', pad=20)
+    ax.set_xticks(np.arange(len(col_labels)) + 0.5)
+    ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=10)
+    ax.set_yticks(np.arange(len(row_labels)) + 0.5)
+    ax.set_yticklabels(row_labels, fontsize=10, rotation=0)
+    for _, spine in ax.spines.items():
+        spine.set_visible(True)
+        spine.set_linewidth(3)
+        spine.set_color('white')
+    ax.grid(False)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  Heatmap saved: {filename}")
+
+# ----------------------------------------------------------------------
+# Main function
+# ----------------------------------------------------------------------
+def main():
+    config_path = get_config_path()
+    if os.path.exists(config_path):
+        print("Existing configuration found.")
+        use_saved = get_yes_no_input("Load previous configuration? (y/n): ")
+        if use_saved:
+            config = get_all_inputs(use_saved_config=True)
+        else:
+            config = get_all_inputs(use_saved_config=False)
+    else:
+        config = get_all_inputs(use_saved_config=False)
+
+    output_dir = get_directory_path("\nEnter the path to save results: ")
+
+    y_type = config['y_type']
+    use_log_y = config['use_log_y']
+    use_log_x = config['use_log_x']
+    drift_limit = config['drift_limit']
+    drift_limit_ratio = drift_limit / 100.0
+    reference_drift_limit = config['reference_drift_limit']
+    floor_height = config.get('floor_height', 1.0)
+    disp_folder = config['displacement_folder']
+    im_folder = config['im_folder']
+    walls_config = config['walls']  # list of {name, y_col, file_index}
+
+    if y_type == 1:
+        y_type_label = 'Drift Ratio (max displacement / floor height)'
+    elif y_type == 2:
+        y_type_label = 'Average Relative Displacement'
+    else:
+        y_type_label = 'Drift Ratio (last floor displacement / wall height)'
+
+    stats_file = open(os.path.join(output_dir, "regression_statistics.txt"), "w")
+    stats_file.write("Wall Power Law Regression Analysis with Full Statistics\n")
+    stats_file.write("="*80 + "\n")
+    stats_file.write(f"Analysis performed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    stats_file.write("Model: Y = a × X^b (Power Law Regression)\n")
+    stats_file.write(f"Maximum drift included: {drift_limit}%\n")
+    stats_file.write(f"Reference drift limit line: {reference_drift_limit}%\n")
+    stats_file.write("="*80 + "\n\n")
+
+    formulas_file = open(os.path.join(output_dir, "regression_formulas_table.txt"), "w")
+    formulas_file.write("Power Law Regression Formulas and Statistics Table\n")
+    formulas_file.write("="*100 + "\n")
+    formulas_file.write(f"Analysis performed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    formulas_file.write("Model: Y = a × X^b\n")
+    formulas_file.write(f"Maximum drift included: {drift_limit}%\n")
+    formulas_file.write("="*100 + "\n")
+    formulas_file.write("Wall | Intensity | a | b | R²_log | R²_orig | σ | e^σ | SE(b) | SE(lna) | 95% CI b | 95% CI a | t(b=0) | p(b=0) | t(b=1) | p(b=1) | Points used/total | Interpretation\n")
+    formulas_file.write("-"*150 + "\n")
+
+    all_headers_set = set()
+    all_wall_names = []
+    wall_markers = {}
+    wall_line_styles = {}
+    walls_data = {}
+
+    total_data_points = 0
+    total_removed_points = 0
+    total_exceed_drift_points = 0
+
+    # Process each wall
+    for idx, wall_info in enumerate(walls_config):
+        wall_name = wall_info['name']
+        file_index = wall_info['file_index']
+        y_col = wall_info['y_col']
+        all_wall_names.append(wall_name)
+        wall_markers[wall_name] = MARKERS[idx % len(MARKERS)]
+        wall_line_styles[wall_name] = LINE_STYLES[idx % len(LINE_STYLES)]
+        walls_data[wall_name] = {}
+
+        # Locate files
+        disp_path = get_file_extension_agnostic_path(disp_folder, f"Z{file_index}")
+        im_path = get_file_extension_agnostic_path(im_folder, f"Z{file_index}")
+        if disp_path is None:
+            print(f"ERROR: Displacement file for Z{file_index} not found in {disp_folder}. Skipping wall {wall_name}.")
+            stats_file.write(f"\nWALL: {wall_name} - SKIPPED (displacement file missing)\n")
+            continue
+        if im_path is None:
+            print(f"ERROR: IM file for Z{file_index} not found in {im_folder}. Skipping wall {wall_name}.")
+            stats_file.write(f"\nWALL: {wall_name} - SKIPPED (IM file missing)\n")
+            continue
+
+        print(f"\nProcessing {wall_name} (files: {os.path.basename(disp_path)}, {os.path.basename(im_path)})")
+        stats_file.write(f"\nWALL: {wall_name}\n")
+        stats_file.write("-"*60 + "\n")
+
+        # Read displacement
+        y_col_index = ord(y_col) - ord('A')
+        y_df = pd.read_excel(disp_path, header=None, skiprows=1, usecols=[y_col_index])
+        displacement_data = y_df.iloc[:, 0].astype(float).values
+        if y_type == 1 or y_type == 3:
+            y_data_full = displacement_data / floor_height
+        else:
+            y_data_full = displacement_data
+
+        # Read intensity measures (hardcoded columns B-M, same as original)
+        x_df = pd.read_excel(im_path, usecols=range(1, 13))
+        x_headers = x_df.columns.tolist()
+        all_headers_set.update(x_headers)
+
+        for j, header in enumerate(x_headers):
+            x_data_full = x_df[header].astype(float).values
+            X_filtered, Y_filtered, warning_msg, removed_stats, total_count = filter_data_for_power_law(
+                x_data_full, y_data_full, wall_name, header, drift_limit_ratio
+            )
+            total_data_points += total_count
+            total_removed_points += removed_stats['removed_total']
+            total_exceed_drift_points += removed_stats['removed_exceed_drift']
+
+            if warning_msg:
+                print(warning_msg)
+                stats_file.write(warning_msg + "\n")
+
+            if len(X_filtered) < 2:
+                print(f" Not enough valid data for {header} (need at least 2 points)")
+                stats_file.write(f"{header}: Not enough valid data points after filtering (need at least 2)\n\n")
+                continue
+
+            res = fit_power_law_with_stats(X_filtered, Y_filtered)
+            if res[0] is None:
+                print(f" Could not fit power law for {header}")
+                stats_file.write(f"{header}: Could not fit power law model\n\n")
+                continue
+
+            (a, b, r2_log, r2_orig, sigma, factor,
+             se_b, se_lna, ci_b, ci_a,
+             t_b0, t_b1, p_b0, p_b1,
+             residuals_log, Y_pred_orig, n, df) = res
+
+            walls_data[wall_name][header] = {
+                'X_filtered': X_filtered,
+                'Y_filtered': Y_filtered,
+                'a': a, 'b': b, 'r2_log': r2_log, 'r2_orig': r2_orig,
+                'sigma': sigma, 'factor': factor,
+                'n_used': n, 'n_total': total_count,
+                'se_b': se_b, 'se_lna': se_lna, 'ci_b': ci_b, 'ci_a': ci_a,
+                't_b0': t_b0, 't_b1': t_b1, 'p_b0': p_b0, 'p_b1': p_b1
+            }
+
+            stats_file.write(f"{header}:\n")
+            stats_file.write(f"  Data: {n} of {total_count} points used (removed {total_count - n})\n")
+            stats_file.write(f"  a = {a:.6f}, b = {b:.6f}\n")
+            stats_file.write(f"  R²_log = {r2_log:.4f}, R²_orig = {r2_orig:.4f}\n")
+            stats_file.write(f"  Dispersion σ = {sigma:.4f}, multiplicative factor e^σ = {factor:.4f}\n")
+            stats_file.write(f"  SE(b) = {se_b:.6f}, SE(ln a) = {se_lna:.6f}\n")
+            stats_file.write(f"  95% CI for b: [{ci_b[0]:.4f}, {ci_b[1]:.4f}]\n")
+            stats_file.write(f"  95% CI for a: [{ci_a[0]:.4f}, {ci_a[1]:.4f}]\n")
+            stats_file.write(f"  t(b=0) = {t_b0:.4f}, p(b=0) = {p_b0:.4e}\n")
+            stats_file.write(f"  t(b=1) = {t_b1:.4f}, p(b=1) = {p_b1:.4e}\n")
+            stats_file.write(f"  Exponent interpretation: {interpret_exponent(b)}\n\n")
+
+            formulas_file.write(
+                f"{wall_name} | {header} | {a:.6f} | {b:.6f} | {r2_log:.4f} | {r2_orig:.4f} | "
+                f"{sigma:.4f} | {factor:.4f} | {se_b:.6f} | {se_lna:.6f} | "
+                f"[{ci_b[0]:.4f},{ci_b[1]:.4f}] | [{ci_a[0]:.4f},{ci_a[1]:.4f}] | "
+                f"{t_b0:.4f} | {p_b0:.4e} | {t_b1:.4f} | {p_b1:.4e} | "
+                f"{n}/{total_count} | {interpret_exponent(b)}\n"
+            )
+
+            create_individual_plot(
+                wall_name, header, X_filtered, Y_filtered, a, b,
+                r2_log, r2_orig, sigma,
+                total_count, n, drift_limit_ratio, reference_drift_limit,
+                use_log_x, use_log_y, wall_markers[wall_name], output_dir
+            )
+            print(f" ✓ {header}: R²_log={r2_log:.3f}, σ={sigma:.3f}, {n}/{total_count} points")
+
+    # Summary
+    stats_file.write("\n" + "="*60 + "\n")
+    stats_file.write("OVERALL FILTERING SUMMARY\n")
+    stats_file.write("="*60 + "\n")
+    stats_file.write(f"Total data points analyzed: {total_data_points}\n")
+    stats_file.write(f"Points removed (all reasons): {total_removed_points} ({total_removed_points/total_data_points*100:.1f}%)\n")
+    stats_file.write(f"Points exceeding drift limit: {total_exceed_drift_points} ({total_exceed_drift_points/total_data_points*100:.1f}%)\n")
+    stats_file.write(f"Points used for regression: {total_data_points - total_removed_points}\n")
+    stats_file.write("\nNote: Filtering criteria: power law requires X>0 and Y>0; Y > drift limit excluded; NaNs excluded.\n")
+
+    stats_file.close()
+    formulas_file.close()
+
+    # Heatmaps and comparative plots
+    print("\nGenerating additional visualizations...")
+    all_headers = sorted(list(all_headers_set))
+    n_ims = len(all_headers)
+    n_walls = len(all_wall_names)
+    r2_matrix = np.full((n_ims, n_walls), np.nan)
+    sigma_matrix = np.full((n_ims, n_walls), np.nan)
+
+    for i, header in enumerate(all_headers):
+        for j, wall_name in enumerate(all_wall_names):
+            if wall_name in walls_data and header in walls_data[wall_name]:
+                r2_matrix[i, j] = walls_data[wall_name][header]['r2_log']
+                sigma_matrix[i, j] = walls_data[wall_name][header]['sigma']
+
+    create_heatmap(r2_matrix, all_headers, all_wall_names,
+                   title='R² (log space) - Power Law Fit',
+                   filename=os.path.join(output_dir, 'R2_log_heatmap.png'),
+                   vmin=0, vmax=1, cmap='RdYlGn', annot=True, fmt='.3f')
+
+    sigma_vals = sigma_matrix[~np.isnan(sigma_matrix)]
+    if len(sigma_vals) > 0:
+        vmin_sigma = np.min(sigma_vals)
+        vmax_sigma = np.max(sigma_vals)
+        if vmin_sigma == vmax_sigma:
+            vmin_sigma = vmin_sigma * 0.9
+            vmax_sigma = vmax_sigma * 1.1
+    else:
+        vmin_sigma, vmax_sigma = 0, 1
+    create_heatmap(sigma_matrix, all_headers, all_wall_names,
+                   title=f'Dispersion σ (green=low, red=high)',
+                   filename=os.path.join(output_dir, 'sigma_heatmap.png'),
+                   vmin=vmin_sigma, vmax=vmax_sigma, cmap='RdYlGn_r', annot=True, fmt='.3f')
+
+    print("Creating comparative plots per intensity measure...")
+    for header in all_headers:
+        create_comparative_plot(header, walls_data, all_wall_names, wall_markers, wall_line_styles,
+                                use_log_x, use_log_y, drift_limit_ratio, reference_drift_limit,
+                                y_type_label, output_dir)
+    print("  Comparative plots saved.")
+
+    print(f"\nAll results saved to: {output_dir}")
+    print("Analysis complete.")
+
+if __name__ == "__main__":
+    main()
