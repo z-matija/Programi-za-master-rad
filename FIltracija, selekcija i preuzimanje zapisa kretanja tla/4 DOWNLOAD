@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+ESM Waveform Downloader - Phase 3 (ZIP Archive Version)
+
+Description:
+    This script downloads waveform data as ZIP archives containing .asc files
+    for available ESM records. It reads a CSV file of available records,
+    authenticates using an ESM token, and saves ZIP files directly without
+    extraction, organized for research use. A manifest, summary report, and
+    metadata files are generated alongside the downloads.
+"""
+
+# --- Standard Library Imports ---
+import csv
+import json
+import os
+import sys
+import time
+from datetime import datetime
+
+# --- Third-Party Imports ---
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+def create_session():
+    """Create and configure a requests session with retry strategy."""
+    session = requests.Session()
+    
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST", "GET"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+def download_waveform_zip(session, event_id, station_code, token_content, output_dir):
+    """
+    Download a single waveform as a ZIP archive containing .asc files.
+    
+    Returns:
+        tuple: (success: bool, zip_filename: str, message: str, file_size: int)
+    """
+    try:
+        # ESM download endpoint
+        url = "https://esm-db.eu/esmws/eventdata/1/query"
+        
+        # CRITICAL CHANGE: Use 'ascii' format to get ZIP archives
+        params = {
+            'eventid': event_id,
+            'station': station_code,
+            'format': 'ascii'  # This returns a ZIP file with .asc files inside
+        }
+        
+        # Send authenticated request
+        response = session.post(
+            url,
+            params=params,
+            files={'message': ('token.txt', token_content, 'application/octet-stream')},
+            timeout=60,
+            stream=True  # Stream the response for efficient download
+        )
+        
+        if response.status_code == 200:
+            # Create a safe filename for the ZIP archive
+            safe_event = str(event_id).replace('/', '_').replace('\\', '_')
+            safe_station = str(station_code).replace('/', '_').replace('\\', '_')
+            zip_filename = f"{safe_event}_{safe_station}.zip"
+            zip_filepath = os.path.join(output_dir, zip_filename)
+            
+            # Save the ZIP archive directly
+            with open(zip_filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            # Verify the file was saved and get its size
+            if os.path.exists(zip_filepath):
+                file_size = os.path.getsize(zip_filepath)
+                return True, zip_filename, "ZIP archive downloaded successfully", file_size
+            else:
+                return False, "", "Failed to save ZIP file", 0
+            
+        else:
+            error_msg = f"HTTP {response.status_code}"
+            if response.status_code == 403:
+                error_msg = "Forbidden (check token permissions)"
+            elif response.status_code == 404:
+                error_msg = "Waveform not found"
+            elif response.status_code == 500:
+                error_msg = "Server error - ESM service may be down"
+            return False, "", error_msg, 0
+            
+    except requests.exceptions.Timeout:
+        return False, "", "Request timeout", 0
+    except requests.exceptions.ConnectionError:
+        return False, "", "Connection error", 0
+    except Exception as e:
+        return False, "", f"Error: {str(e)}", 0
+
+def show_progress(current, total, start_time, success_count, fail_count, downloaded_mb):
+    """Show a text-based progress bar with statistics."""
+    percent = (current / total) * 100 if total > 0 else 0
+    elapsed = time.time() - start_time
+    
+    # Calculate ETA
+    if current > 0 and success_count + fail_count > 0:
+        estimated_total = (elapsed / current) * total
+        eta = max(0, estimated_total - elapsed)
+        eta_str = f"ETA: {eta:.0f}s"
+    else:
+        eta_str = ""
+    
+    # Progress bar
+    bar_length = 30
+    filled_length = int(bar_length * current // total) if total > 0 else 0
+    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+    
+    # Status line
+    status = (f"[{bar}] {percent:.1f}% ({current}/{total}) | "
+              f"✓{success_count} ✗{fail_count} | {downloaded_mb:.1f}MB | {eta_str}")
+    sys.stdout.write(f"\r{status}")
+    sys.stdout.flush()
+
+def get_file_path(prompt, default=None):
+    """Prompt user for a file path with validation."""
+    while True:
+        if default:
+            user_input = input(f"{prompt} [{default}]: ").strip()
+            if not user_input:
+                user_input = default
+        else:
+            user_input = input(f"{prompt}: ").strip()
+        
+        if os.path.exists(user_input):
+            return user_input
+        else:
+            print(f" File not found: {user_input}")
+            print("   Please enter a valid file path.")
+
+def main():
+    """Main interactive function."""
+    print("\n" + "="*70)
+    print("ESM WAVEFORM DOWNLOADER - ZIP ARCHIVE VERSION")
+    print("="*70)
+    print("Note: This script downloads waveform data as ZIP archives containing .asc files")
+    print("      The ZIP files are saved directly without extraction.")
+    print("="*70)
+    
+    # Get file paths interactively
+    print("\n Please provide the required file paths:")
+    
+    # Get input CSV file (the available records)
+    input_csv = get_file_path("1. Path to your AVAILABLE records CSV")
+    
+    # Get token file
+    token_file = get_file_path("2. Path to your ESM token file")
+    
+    # Set default output directory
+    base_name = os.path.splitext(os.path.basename(input_csv))[0]
+    default_output = f"{base_name}_waveform_zips"
+    output_dir = input(f"\n3. Output directory name [{default_output}]: ").strip()
+    if not output_dir:
+        output_dir = default_output
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Ask for delay between requests
+    delay_input = input("\n4. Delay between downloads in seconds [1.0]: ").strip()
+    download_delay = float(delay_input) if delay_input else 1.0
+    
+    print(f"\n  Configuration:")
+    print(f"   Input CSV: {input_csv}")
+    print(f"   Token file: {token_file}")
+    print(f"   Output directory: {output_dir}")
+    print(f"   Download format: ZIP archives containing .asc files")
+    print(f"   Request delay: {download_delay} seconds")
+    print(f"   ESM endpoint: https://esm-db.eu/esmws/eventdata/1/query")
+    
+    # Confirm before proceeding
+    confirm = input("\nProceed with download? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Operation cancelled.")
+        return
+    
+    # Read the token file
+    print(f"\n Reading token from: {token_file}")
+    try:
+        with open(token_file, 'rb') as f:
+            token_content = f.read()
+        print(" Token loaded successfully")
+    except Exception as e:
+        print(f" ERROR: Could not read token file: {e}")
+        return
+    
+    # Load the available records CSV
+    print(f"\n Loading available records from: {input_csv}")
+    try:
+        records = []
+        with open(input_csv, 'r', encoding='utf-8') as f:
+            csv_reader = csv.DictReader(f)
+            fieldnames = csv_reader.fieldnames
+            
+            for row in csv_reader:
+                records.append(row)
+        
+        total_records = len(records)
+        print(f" Loaded {total_records:,} available records")
+        
+        if total_records == 0:
+            print(" ERROR: No records found in CSV file")
+            return
+            
+        # Check required columns
+        if 'event_id' not in fieldnames or 'station_code' not in fieldnames:
+            print(" ERROR: CSV must contain 'event_id' and 'station_code' columns")
+            print(f"   Available columns: {', '.join(fieldnames[:10])}..." if len(fieldnames) > 10 else f"   Available columns: {', '.join(fieldnames)}")
+            return
+            
+    except Exception as e:
+        print(f" ERROR: Could not read CSV file: {e}")
+        return
+    
+    # Initialize tracking
+    download_results = []
+    success_count = 0
+    fail_count = 0
+    total_size_bytes = 0
+    
+    # Create download session
+    session = create_session()
+    
+    # Create metadata subdirectory
+    metadata_dir = os.path.join(output_dir, "metadata")
+    os.makedirs(metadata_dir, exist_ok=True)
+    
+    # Start downloading
+    print(f"\n  Starting waveform downloads as ZIP archives...")
+    print(f"   Output directory: {os.path.abspath(output_dir)}")
+    print("-" * 70)
+    
+    start_time = time.time()
+    
+    # Process each record
+    for i, record in enumerate(records):
+        event_id = str(record['event_id'])
+        station_code = str(record['station_code'])
+        
+        # Show progress
+        downloaded_mb = total_size_bytes / (1024 * 1024)
+        show_progress(i + 1, total_records, start_time, success_count, fail_count, downloaded_mb)
+        
+        # Download the waveform as a ZIP archive
+        success, zip_filename, message, file_size = download_waveform_zip(
+            session, event_id, station_code, token_content, output_dir
+        )
+        
+        # Record result
+        result = {
+            'index': i,
+            'event_id': event_id,
+            'station_code': station_code,
+            'success': success,
+            'zip_filename': zip_filename,
+            'message': message,
+            'file_size_bytes': file_size,
+            'file_size_mb': file_size / (1024 * 1024) if file_size > 0 else 0,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Save individual metadata if download was successful
+        if success and zip_filename:
+            metadata_file = os.path.join(metadata_dir, f"{os.path.splitext(zip_filename)[0]}_meta.json")
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                # Combine download result with original record data
+                full_metadata = {**record, **result}
+                json.dump(full_metadata, f, indent=2, ensure_ascii=False)
+        
+        download_results.append(result)
+        
+        if success:
+            success_count += 1
+            total_size_bytes += file_size
+        else:
+            fail_count += 1
+        
+        # Be polite to the server
+        time.sleep(download_delay)
+    
+    # Close session
+    session.close()
+    
+    # Final progress display
+    downloaded_mb = total_size_bytes / (1024 * 1024)
+    show_progress(total_records, total_records, start_time, success_count, fail_count, downloaded_mb)
+    print()  # New line after progress bar
+    
+    # Generate summary files
+    print(f"\n Generating summary files...")
+    
+    # 1. Download manifest (CSV)
+    manifest_file = os.path.join(output_dir, "download_manifest.csv")
+    with open(manifest_file, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = ['index', 'event_id', 'station_code', 'success', 'zip_filename', 
+                     'message', 'file_size_bytes', 'file_size_mb', 'timestamp']
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in download_results:
+            writer.writerow(result)
+    
+    # 2. Summary report (TXT)
+    summary_file = os.path.join(output_dir, "download_summary.txt")
+    total_time = time.time() - start_time
+    
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        f.write("ESM Waveform Download Summary - ZIP Archive Version\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input file: {input_csv}\n")
+        f.write(f"Output directory: {os.path.abspath(output_dir)}\n")
+        f.write(f"Download format: ZIP archives containing .asc files\n")
+        f.write(f"Total processing time: {total_time:.1f} seconds\n")
+        f.write(f"Average time per record: {total_time/total_records:.1f} seconds\n" if total_records > 0 else "Average time per record: N/A\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Total records attempted: {total_records}\n")
+        f.write(f" Successful downloads: {success_count}\n")
+        f.write(f" Failed downloads: {fail_count}\n")
+        f.write(f"Success rate: {success_count/total_records*100:.1f}%\n" if total_records > 0 else "Success rate: N/A\n")
+        f.write(f"Total data downloaded: {downloaded_mb:.2f} MB\n")
+        f.write(f"Average ZIP file size: {downloaded_mb/success_count:.1f} MB\n" if success_count > 0 else "Average file size: N/A\n")
+        f.write("-" * 70 + "\n")
+        
+        if fail_count > 0:
+            f.write("\nFailed downloads:\n")
+            for result in download_results:
+                if not result['success']:
+                    f.write(f"  {result['event_id']}/{result['station_code']}: {result['message']}\n")
+    
+    # 3. File list for easy import (TXT)
+    filelist_file = os.path.join(output_dir, "downloaded_zips.txt")
+    with open(filelist_file, 'w', encoding='utf-8') as f:
+        f.write("# List of successfully downloaded ZIP archive files\n")
+        f.write("# Each ZIP contains .asc waveform files in DYNA 1.2 ASCII format\n")
+        f.write("# Use this file to easily process your downloaded archives\n")
+        for result in download_results:
+            if result['success'] and result['zip_filename']:
+                f.write(f"{result['zip_filename']}\n")
+    
+    print(f" Manifest saved: {os.path.basename(manifest_file)}")
+    print(f" Summary saved: {os.path.basename(summary_file)}")
+    print(f" File list saved: {os.path.basename(filelist_file)}")
+    
+    # Print final summary to console
+    print("\n" + "="*70)
+    print("DOWNLOAD COMPLETE - SUMMARY")
+    print("="*70)
+    print(f"Total time: {total_time:.1f} seconds")
+    print(f"Records attempted: {total_records:,}")
+    print(f" Successful: {success_count:,} ({success_count/total_records*100:.1f}%)" if total_records > 0 else " Successful: 0")
+    print(f" Failed: {fail_count:,}")
+    print(f"Total data: {downloaded_mb:.2f} MB")
+    
+    if success_count > 0:
+        print(f"\n Files saved in: {os.path.abspath(output_dir)}")
+        print(f"   • ZIP archives: {success_count} .zip files")
+        print(f"   • Metadata: {success_count} JSON files in /metadata/")
+        print(f"   • Manifest: {os.path.basename(manifest_file)}")
+        print(f"   • Summary: {os.path.basename(summary_file)}")
+        print(f"   • File list: {os.path.basename(filelist_file)}")
+        
+        # Show first few successful downloads
+        print(f"\nFirst 5 downloaded ZIP files:")
+        count = 0
+        for result in download_results:
+            if result['success'] and count < 5:
+                size_mb = result['file_size_mb']
+                print(f"  {count+1}. {result['zip_filename']} ({size_mb:.2f} MB)")
+                count += 1
+    
+    if fail_count > 0:
+        print(f"\n  {fail_count} download(s) failed. Check the summary file for details.")
+        if fail_count <= 5:
+            print("Failed records:")
+            for result in download_results:
+                if not result['success']:
+                    print(f"  • {result['event_id']}/{result['station_code']}: {result['message']}")
+    
+    # Final note about the contents
+    print(f"\n Note: Each ZIP file contains .asc waveform files in DYNA 1.2 ASCII format.")
+    print(f"   Use your existing scripts to process these .asc files.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n  Download interrupted by user.")
+    except Exception as e:
+        print(f"\n Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        input("\nPress Enter to exit...")
