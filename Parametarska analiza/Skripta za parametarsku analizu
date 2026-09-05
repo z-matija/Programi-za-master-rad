@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+"""
+Unified Power Law Regression – Selective Mode OR Full Sweep Mode
+
+Description:
+    This script performs power law regression analysis with two modes:
+    - Selective mode: Pick one combination per IM (Cordova, INp, ISa, AvgSa)
+    - Sweep mode: Process ALL combinations of ALL FOUR IMs at once
+
+    Features:
+    - Supports per-wall total height for y_type = 3 (max roof drift)
+    - Heatmaps use fixed colour scales: R²: 0=red, 1=green; σ: 0=green, 1=red
+    - Axis labels for sweep heatmaps are parameter-specific (c, α, β, a, b)
+    - Individual plots show the correct Y-axis label for all y_types
+    - Includes DEBUG output to diagnose R² vs sigma relationship
+"""
+
+# --- Standard Library Imports ---
+import os
+import warnings
+import json
+from datetime import datetime
+
+# --- Third-Party Imports ---
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+# ======================================================================
+# DEBUG FLAG – set to True to print detailed regression diagnostics
+# ======================================================================
+DEBUG = True
+
+# ----------------------------------------------------------------------
+# Set Times New Roman as default font for all plots
+# ----------------------------------------------------------------------
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['font.size'] = 10
+
+# ----------------------------------------------------------------------
+# Constants and style
+# ----------------------------------------------------------------------
+MARKERS = ['^', 's', '+', 'o', 'v', '<', '>', 'p', '*', 'x', 'D', 'h']
+LINE_STYLES = ['-', '--', '-.', ':']
+COLOR = 'black'
+
+# List of all IMs to process in sweep mode
+SWEEP_IM_TYPES = ['Cordova', 'INp', 'ISa', 'AvgSa']
+
+# ----------------------------------------------------------------------
+# Configuration persistence
+# ----------------------------------------------------------------------
+CONFIG_FILENAME = "unified_powerlaw_config.json"
+
+def get_config_dir():
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+def get_config_path():
+    return os.path.join(get_config_dir(), CONFIG_FILENAME)
+
+def save_config(config):
+    config_path = get_config_path()
+    save_copy = {
+        'mode': config['mode'],
+        'main_folder': config['main_folder'],
+        'disp_folder': config['disp_folder'],
+        'num_walls': config['num_walls'],
+        'drift_limit': config['drift_limit'],
+        'reference_drift_limit': config['reference_drift_limit'],
+        'y_type': config['y_type'],
+        'height': config.get('height', 1.0),          # common height for y_type=1
+        'use_log_y': config['use_log_y'],
+        'use_log_x': config['use_log_x'],
+        'wall_columns': config.get('wall_columns', {}),
+        'wall_heights': config.get('wall_heights', {})  # per‑wall heights for y_type=3
+    }
+    if config['mode'] == 'selective':
+        save_copy['selected_ims'] = config.get('selected_ims', [])
+    else:
+        save_copy['sweep_im'] = 'all'
+    with open(config_path, 'w') as f:
+        json.dump(save_copy, f, indent=2)
+    print(f"Configuration saved to {config_path}")
+
+def load_config():
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, 'r') as f:
+            saved = json.load(f)
+        required = ['mode', 'main_folder', 'disp_folder', 'num_walls', 'drift_limit',
+                    'reference_drift_limit', 'y_type', 'use_log_y', 'use_log_x']
+        if all(k in saved for k in required):
+            if 'wall_heights' not in saved:
+                saved['wall_heights'] = {}
+            return saved
+        else:
+            print("Config file missing required fields. Ignoring.")
+            return None
+    except Exception as e:
+        print(f"Error loading config: {e}. Ignoring.")
+        return None
+
+def confirm_section(section_name, current_value, display_func=None):
+    if display_func:
+        display_func(current_value)
+    else:
+        print(f"{section_name}: {current_value}")
+    return get_yes_no_input(f"Keep this {section_name}? (y/n): ")
+
+# ----------------------------------------------------------------------
+# Input helper functions
+# ----------------------------------------------------------------------
+def get_float_input(prompt, default_value=None):
+    while True:
+        user_input = input(prompt).strip()
+        if not user_input and default_value is not None:
+            return default_value
+        try:
+            return float(user_input)
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+def get_int_input(prompt):
+    while True:
+        user_input = input(prompt).strip()
+        try:
+            return int(user_input)
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
+
+def get_yes_no_input(prompt):
+    while True:
+        user_input = input(prompt).strip().lower()
+        if user_input in ['y', 'yes']:
+            return True
+        elif user_input in ['n', 'no']:
+            return False
+        else:
+            print("Invalid input. Please enter 'y' or 'n'.")
+
+def get_directory_path(prompt):
+    while True:
+        raw = input(prompt).strip().strip('"')
+        if os.path.isdir(raw):
+            return raw
+        else:
+            print(f"Directory not found: {raw}")
+            print("Please enter a valid directory.")
+
+def get_file_path_agnostic(folder, basename):
+    for ext in ['.xlsx', '.txt']:
+        path = os.path.join(folder, basename + ext)
+        if os.path.isfile(path):
+            return path
+    return None
+
+def get_column_letter_input(prompt):
+    while True:
+        col_letter = input(prompt).strip().upper()
+        if len(col_letter) == 1 and col_letter.isalpha():
+            return col_letter
+        else:
+            print("Invalid input. Please enter a single letter (e.g., 'A').")
+
+def extract_number_from_filename(filename):
+    try:
+        base = os.path.splitext(filename)[0]
+        try:
+            num = int(float(base))
+            return num
+        except:
+            pass
+        if base.endswith('C') or base.endswith('c'):
+            num_part = base[:-1]
+            try:
+                num = int(float(num_part))
+                return num
+            except:
+                pass
+        import re
+        match = re.match(r'(\d+)', base)
+        if match:
+            return int(match.group(1))
+        return None
+    except Exception:
+        return None
+
+def parse_parameter_columns(im_type, df_im):
+    params = []
+    if im_type in ['Cordova', 'INp']:
+        for col in df_im.columns:
+            if col.startswith(f'{im_type}_c'):
+                parts = col.split('_')
+                c_part = parts[1]
+                a_part = parts[2]
+                c_val = float(c_part[1:])
+                alpha_val = float(a_part[1:])
+                label = f"{im_type} (c={c_val:.1f}, α={alpha_val:.2f})"
+                params.append((c_val, alpha_val, col, label))
+    elif im_type == 'ISa':
+        for col in df_im.columns:
+            if col.startswith('ISa_a'):
+                parts = col.split('_')
+                a_part = parts[1]
+                b_part = parts[2]
+                alpha_val = float(a_part[1:])
+                beta_val = float(b_part[1:])
+                label = f"ISa (α={alpha_val:.2f}, β={beta_val:.2f})"
+                params.append((alpha_val, beta_val, col, label))
+    elif im_type == 'AvgSa':
+        for col in df_im.columns:
+            if col.startswith('AvgSa_a'):
+                parts = col.split('_')
+                a_part = parts[1]
+                b_part = parts[2]
+                a_val = float(a_part[1:])
+                b_val = float(b_part[1:])
+                label = f"Avg Sa (a={a_val:.2f}, b={b_val:.2f})"
+                params.append((a_val, b_val, col, label))
+    return params
+
+def select_ims_interactive(main_folder, num_walls):
+    im_types = ['Cordova', 'INp', 'ISa', 'AvgSa']
+    selected = []
+    filename_map = {'Cordova': 'Cordova', 'INp': 'INp', 'ISa': 'ISa', 'AvgSa': 'Avg_Sa'}
+    first_wall = f"Z1"
+    for im in im_types:
+        print(f"\n--- Selecting parameter combination for {im} ---")
+        actual_filename = filename_map.get(im, im)
+        im_file = get_file_path_agnostic(os.path.join(main_folder, first_wall), actual_filename)
+        if im_file is None:
+            print(f"  {actual_filename} file not found for {first_wall}. Skipping {im}.")
+            continue
+        if im_file.endswith('.xlsx'):
+            df_im = pd.read_excel(im_file)
+        else:
+            df_im = pd.read_csv(im_file, delimiter=r'\s+')
+        params = parse_parameter_columns(im, df_im)
+        if not params:
+            print(f"  No parameter columns found for {im}. Skipping.")
+            continue
+        print(f"  Available combinations:")
+        for i, (p1, p2, col, label) in enumerate(params, 1):
+            print(f"    {i}. {label}")
+        choice = get_int_input(f"Select combination (1-{len(params)}): ")
+        if 1 <= choice <= len(params):
+            selected.append((im, params[choice-1][2], params[choice-1][3]))
+        else:
+            print("  Invalid choice. Skipping this IM.")
+    return selected
+
+# ----------------------------------------------------------------------
+# Data filtering and regression
+# ----------------------------------------------------------------------
+def filter_data_for_power_law(X, Y, drift_limit_percent):
+    valid_mask = (X > 0) & (Y > 0) & (~np.isnan(X)) & (~np.isnan(Y))
+    if drift_limit_percent is not None:
+        valid_mask = valid_mask & (Y <= drift_limit_percent)
+    return X[valid_mask], Y[valid_mask]
+
+def fit_power_law_with_stats(X, Y):
+    mask = (X > 0) & (Y > 0)
+    X = X[mask]
+    Y = Y[mask]
+    n = len(X)
+    if n < 2:
+        return (None,) * 18
+
+    log_X = np.log(X)
+    log_Y = np.log(Y)
+
+    model = LinearRegression()
+    model.fit(log_X.reshape(-1, 1), log_Y)
+    b = model.coef_[0]
+    ln_a = model.intercept_
+    a = np.exp(ln_a)
+
+    log_Y_pred = model.predict(log_X.reshape(-1, 1))
+    Y_pred_orig = a * (X ** b)
+
+    r2_log = model.score(log_X.reshape(-1, 1), log_Y)
+    r2_orig = r2_score(Y, Y_pred_orig)
+
+    residuals_log = log_Y - log_Y_pred
+    SSE_log = np.sum(residuals_log ** 2)
+    sigma = np.sqrt(SSE_log / (n - 2))
+
+    X_bar = np.mean(log_X)
+    Sxx = np.sum((log_X - X_bar) ** 2)
+    se_b = sigma / np.sqrt(Sxx)
+    se_ln_a = sigma * np.sqrt(1.0/n + (X_bar**2)/Sxx)
+
+    t_b0 = b / se_b
+    t_b1 = (b - 1) / se_b
+    df = n - 2
+    p_b0 = 2 * stats.t.sf(abs(t_b0), df)
+    p_b1 = 2 * stats.t.sf(abs(t_b1), df)
+
+    alpha = 0.05
+    t_crit = stats.t.ppf(1 - alpha/2, df)
+    ci_b = (b - t_crit * se_b, b + t_crit * se_b)
+    ci_ln_a = (ln_a - t_crit * se_ln_a, ln_a + t_crit * se_ln_a)
+    ci_a = (np.exp(ci_ln_a[0]), np.exp(ci_ln_a[1]))
+    factor = np.exp(sigma)
+
+    return (a, b, r2_log, r2_orig, sigma, factor,
+            se_b, se_ln_a, ci_b, ci_a,
+            t_b0, t_b1, p_b0, p_b1,
+            residuals_log, Y_pred_orig, n, df)
+
+def interpret_exponent(b):
+    if abs(b - 1.0) < 0.1:
+        return "approximately linear response"
+    elif b > 1.1:
+        return "super-linear response (b > 1)"
+    elif b < 0.9:
+        return "sub-linear response (b < 1)"
+    else:
+        return "near-linear response"
+
+# ----------------------------------------------------------------------
+# Plotting functions
+# ----------------------------------------------------------------------
+def create_individual_plot(display_name, im_label, X_valid, Y_valid, a, b, r2_log, r2_orig, sigma,
+                           total_count, filtered_count, drift_limit_percent, reference_drift_limit,
+                           use_log_x, use_log_y, wall_marker, output_dir, y_label):
+    plt.figure(figsize=(14, 10))
+    plt.scatter(X_valid, Y_valid, marker=wall_marker, color=COLOR, alpha=0.7, s=30)
+    x_plot = np.linspace(X_valid.min(), X_valid.max(), 300)
+    y_plot = a * (x_plot ** b)
+    plt.plot(x_plot, y_plot, color=COLOR, linestyle='-', linewidth=1.5,
+             label=f'y = {a:.4f} x^{b:.3f}')
+    if use_log_y:
+        plt.yscale('log')
+    if use_log_x:
+        plt.xscale('log')
+    plt.ylim(top=np.max(Y_valid) * 1.05)
+    plt.xlabel(im_label, fontfamily='Times New Roman', fontsize=18)
+    plt.ylabel(y_label, fontfamily='Times New Roman', fontsize=18)
+    plt.title(f'{display_name} - {im_label}', fontfamily='Times New Roman', fontsize=18)
+    ann_text = (f'$a = {a:.4f}$, $b = {b:.3f}$\n'
+                f'$R^2_{{log}} = {r2_log:.3f}$, $R^2_{{orig}} = {r2_orig:.3f}$\n'
+                f'$\\sigma = {sigma:.3f}$, $e^{{\\sigma}} = {np.exp(sigma):.3f}$\n')
+    plt.text(0.02, 0.98, ann_text, transform=plt.gca().transAxes,
+             fontsize=18, verticalalignment='top', fontfamily='Times New Roman',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    plt.legend(loc='best', prop={'family': 'Times New Roman', 'size': 18})
+    plt.grid(True, alpha=0.3)
+    safe_wall = "".join(c for c in display_name if c.isalnum() or c in (' ', '_')).rstrip()
+    safe_im = "".join(c for c in im_label if c.isalnum() or c in (' ', '_', '=', '(', ')')).rstrip()
+    scale_suffix = ""
+    if use_log_x and use_log_y:
+        scale_suffix = "_log_log"
+    elif use_log_x:
+        scale_suffix = "_log_x"
+    elif use_log_y:
+        scale_suffix = "_log_y"
+    filename = os.path.join(output_dir, f"{safe_wall}_{safe_im}_powerlaw{scale_suffix}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_diagnostic_plots_and_csv(display_name, im_label, residuals_log, fitted_log, output_dir):
+    diag_dir = os.path.join(output_dir, "diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+    safe_wall = "".join(c for c in display_name if c.isalnum() or c in (' ', '_')).rstrip()
+    safe_im = "".join(c for c in im_label if c.isalnum() or c in (' ', '_', '=', '(', ')')).rstrip()
+    base_name = f"{safe_wall}_{safe_im}"
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(fitted_log, residuals_log, alpha=0.7, color='black')
+    plt.axhline(y=0, color='red', linestyle='--', linewidth=1.5)
+    plt.xlabel('Fitted values (log scale)', fontfamily='Times New Roman')
+    plt.ylabel('Residuals', fontfamily='Times New Roman')
+    plt.title(f'{display_name} - {im_label}\nResiduals vs Fitted', fontfamily='Times New Roman')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(diag_dir, f"{base_name}_residuals_vs_fitted.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    plt.figure(figsize=(8, 6))
+    stats.probplot(residuals_log, dist="norm", plot=plt)
+    plt.title(f'{display_name} - {im_label}\nNormal Q-Q Plot', fontfamily='Times New Roman')
+    plt.xlabel('Theoretical Quantiles', fontfamily='Times New Roman')
+    plt.ylabel('Sample Quantiles', fontfamily='Times New Roman')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(diag_dir, f"{base_name}_qq_plot.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    df_diag = pd.DataFrame({'fitted_log': fitted_log, 'residuals_log': residuals_log})
+    csv_path = os.path.join(diag_dir, f"{base_name}_diagnostics.csv")
+    df_diag.to_csv(csv_path, index=False)
+    print(f"  Diagnostics saved to {diag_dir} for {display_name} - {im_label}")
+
+def create_comparative_plot(im_label, walls_data, all_display_names, wall_markers, wall_line_styles,
+                            use_log_x, use_log_y, reference_drift_limit, y_type_label, output_dir):
+    plt.figure(figsize=(14, 10))
+    plotted = False
+    colour_list = ['red', 'green', 'blue', 'orange', 'purple']
+    marker_list = ['o', 's', '^', 'D', 'v']
+    all_Y = []
+    for idx, display_name in enumerate(all_display_names):
+        if display_name not in walls_data or im_label not in walls_data[display_name]:
+            continue
+        wdata = walls_data[display_name][im_label]
+        X = wdata['X_filtered']
+        Y = wdata['Y_filtered']
+        a = wdata['a']
+        b = wdata['b']
+        n_used = wdata['n_used']
+        n_total = wdata['n_total']
+        all_Y.extend(Y)
+        colour = colour_list[idx % len(colour_list)]
+        marker = marker_list[idx % len(marker_list)]
+        plt.scatter(X, Y, marker=marker, color=colour, alpha=0.5, s=30,
+                    label=f'{display_name}')
+        x_plot = np.linspace(X.min(), X.max(), 300)
+        y_plot = a * (x_plot ** b)
+        plt.plot(x_plot, y_plot, color=colour, linestyle=wall_line_styles[display_name],
+                 linewidth=1.5)
+        plotted = True
+    if not plotted:
+        return
+    if all_Y:
+        max_y = max(all_Y)
+        min_y = min(all_Y)
+        plt.ylim(bottom=min_y * 0.95, top=max_y * 1.05)
+    if use_log_y:
+        plt.yscale('log')
+    if use_log_x:
+        plt.xscale('log')
+    plt.tick_params(axis='both', labelsize=16)
+    plt.xlabel(im_label, fontfamily='Times New Roman', fontsize=18)
+    plt.ylabel(y_type_label, fontfamily='Times New Roman', fontsize=18)
+    plt.title(f'Komparativna analiza: {im_label}', fontfamily='Times New Roman', fontsize=18)
+    plt.legend(loc='best', prop={'family': 'Times New Roman', 'size': 18})
+    plt.grid(True, alpha=0.3)
+    safe_im = "".join(c for c in im_label if c.isalnum() or c in (' ', '_', '=', '(', ')')).rstrip()
+    scale_suffix = ""
+    if use_log_x and use_log_y:
+        scale_suffix = "_log_log"
+    elif use_log_x:
+        scale_suffix = "_log_x"
+    elif use_log_y:
+        scale_suffix = "_log_y"
+    filename = os.path.join(output_dir, f"comparative_{safe_im}_powerlaw{scale_suffix}.png")
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def create_heatmap(data_matrix, row_labels, col_labels, title, filename,
+                   xlabel='Parameter b (or second parameter)',
+                   ylabel='Parameter a (or first parameter)',
+                   vmin=None, vmax=None, cmap='RdYlGn', annot=True, fmt='.3f'):
+    if data_matrix.size == 0:
+        print(f"  Warning: No data for heatmap {title}")
+        return
+    n_rows, n_cols = data_matrix.shape
+    cell_size = 0.8
+    fig_width = max(10, n_cols * cell_size + 2)
+    fig_height = max(8, n_rows * cell_size + 1.5)
+    plt.figure(figsize=(fig_width, fig_height))
+    mask = np.isnan(data_matrix)
+    ax = sns.heatmap(data_matrix, annot=annot, fmt=fmt, cmap=cmap, mask=mask,
+                     vmin=vmin, vmax=vmax, linewidths=2, linecolor='white',
+                     square=True, cbar_kws={'label': title, 'shrink': 0.8},
+                     annot_kws={'size': 10, 'weight': 'bold', 'color': 'black', 'family': 'Times New Roman'})
+    ax.set_xlabel(xlabel, fontsize=13, fontweight='bold', fontfamily='Times New Roman')
+    ax.set_ylabel(ylabel, fontsize=13, fontweight='bold', fontfamily='Times New Roman')
+    ax.set_title(title, fontsize=15, fontweight='bold', pad=20, fontfamily='Times New Roman')
+    ax.set_xticks(np.arange(len(col_labels)) + 0.5)
+    ax.set_xticklabels(col_labels, rotation=45, ha='right', fontsize=10, fontfamily='Times New Roman')
+    ax.set_yticks(np.arange(len(row_labels)) + 0.5)
+    ax.set_yticklabels(row_labels, fontsize=10, rotation=0, fontfamily='Times New Roman')
+    for _, spine in ax.spines.items():
+        spine.set_visible(True)
+        spine.set_linewidth(3)
+        spine.set_color('white')
+    ax.grid(False)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  Heatmap saved: {filename}")
+
+# ----------------------------------------------------------------------
+# Sweep mode specific functions
+# ----------------------------------------------------------------------
+def create_sweep_heatmaps(df_wall, wall_name, im_type, output_dir):
+    p1_vals = sorted(df_wall['p1'].unique())
+    p2_vals = sorted(df_wall['p2'].unique())
+    r2_mat = np.full((len(p1_vals), len(p2_vals)), np.nan)
+    sigma_mat = np.full((len(p1_vals), len(p2_vals)), np.nan)
+    for _, row in df_wall.iterrows():
+        i = p1_vals.index(row['p1'])
+        j = p2_vals.index(row['p2'])
+        r2_mat[i, j] = row['r2_log']
+        sigma_mat[i, j] = row['sigma']
+    if im_type in ['Cordova', 'INp']:
+        row_labels = [f"c={v:.1f}" for v in p1_vals]
+        col_labels = [f"α={v:.2f}" for v in p2_vals]
+        xlabel = 'α'
+        ylabel = 'c'
+    elif im_type == 'ISa':
+        row_labels = [f"α={v:.2f}" for v in p1_vals]
+        col_labels = [f"β={v:.2f}" for v in p2_vals]
+        xlabel = 'β'
+        ylabel = 'α'
+    else:  # AvgSa
+        row_labels = [f"a={v:.2f}" for v in p1_vals]
+        col_labels = [f"b={v:.2f}" for v in p2_vals]
+        xlabel = 'b'
+        ylabel = 'a'
+    safe_wall = "".join(c for c in wall_name if c.isalnum() or c in (' ', '_')).rstrip()
+    create_heatmap(r2_mat, row_labels, col_labels,
+                   title=f"{wall_name} - {im_type} R²",
+                   filename=os.path.join(output_dir, f"{safe_wall}_{im_type}_R2_heatmap.png"),
+                   xlabel=xlabel, ylabel=ylabel,
+                   vmin=0, vmax=1, cmap='RdYlGn', annot=True, fmt='.3f')
+    create_heatmap(sigma_mat, row_labels, col_labels,
+                   title=f"{wall_name} - {im_type} Disperzija σ",
+                   filename=os.path.join(output_dir, f"{safe_wall}_{im_type}_sigma_heatmap.png"),
+                   xlabel=xlabel, ylabel=ylabel,
+                   vmin=0, vmax=1, cmap='RdYlGn_r', annot=True, fmt='.3f')
+
+# ----------------------------------------------------------------------
+# Main function
+# ----------------------------------------------------------------------
+def main():
+    print("="*70)
+    print("UNIFIED POWER LAW REGRESSION")
+    print("Mode 1: Selective (pick one combination per IM)")
+    print("Mode 2: Full sweep (run all combinations of ALL FOUR IMs at once)")
+    print("="*70)
+
+    config_path = get_config_path()
+    use_saved = False
+    if os.path.exists(config_path):
+        print("Existing configuration found.")
+        use_saved = get_yes_no_input("Load previous configuration? (y/n): ")
+
+    if use_saved:
+        saved = load_config()
+        if saved is None:
+            print("Could not load config. Starting fresh.")
+            use_saved = False
+
+    if use_saved:
+        config = saved
+        print(f"\nCurrent analysis mode: {config['mode']}")
+        if not get_yes_no_input("Keep this mode? (y/n): "):
+            mode = get_int_input("Enter 1 for Selective, 2 for Sweep: ")
+            config['mode'] = 'selective' if mode == 1 else 'sweep'
+
+        if not confirm_section("Main folder", config['main_folder']):
+            config['main_folder'] = get_directory_path("Enter main folder path: ")
+        if not confirm_section("Displacement folder", config['disp_folder']):
+            config['disp_folder'] = get_directory_path("Enter displacement folder path: ")
+        if not confirm_section("Number of walls", config['num_walls']):
+            config['num_walls'] = get_int_input("Enter number of walls: ")
+        if not confirm_section("Drift limit (%)", config['drift_limit']):
+            config['drift_limit'] = get_float_input("Enter maximum drift (%): ")
+        if not confirm_section("Reference drift limit (%)", config['reference_drift_limit']):
+            config['reference_drift_limit'] = get_float_input("Enter reference drift limit (%): ")
+        if not confirm_section("Y-value type", config['y_type']):
+            print("1. Max relative displacement / height")
+            print("2. Average relative displacement (as-is)")
+            print("3. Max relative displacement for last floor / height")
+            config['y_type'] = get_int_input("Enter choice (1,2,3): ")
+        if config['y_type'] == 1:
+            if not confirm_section("Floor/wall height (m)", config.get('height', 1.0)):
+                config['height'] = get_float_input("Enter height (m): ")
+            config['wall_heights'] = {}
+        elif config['y_type'] == 3:
+            config['height'] = 1.0
+            if 'wall_heights' not in config:
+                config['wall_heights'] = {}
+        else:
+            config['height'] = 1.0
+            config['wall_heights'] = {}
+
+        if not confirm_section("Log Y-axis", config['use_log_y']):
+            config['use_log_y'] = get_yes_no_input("Use log Y? (y/n): ")
+        if not confirm_section("Log X-axis", config['use_log_x']):
+            config['use_log_x'] = get_yes_no_input("Use log X? (y/n): ")
+
+        wall_cols = config.get('wall_columns', {})
+        wall_heights = config.get('wall_heights', {})
+        print("\nDisplacement column letters per wall:")
+        for wid in [f"Z{i}" for i in range(1, config['num_walls']+1)]:
+            col = wall_cols.get(wid, "not set")
+            hgt = wall_heights.get(wid, "not set") if config['y_type'] == 3 else ""
+            if config['y_type'] == 3:
+                print(f"  {wid}: column {col}, height {hgt} m")
+            else:
+                print(f"  {wid}: column {col}")
+        if not get_yes_no_input("Keep these column assignments? (y/n): "):
+            wall_cols = {}
+            wall_heights = {}
+            for i in range(1, config['num_walls']+1):
+                wid = f"Z{i}"
+                col = get_column_letter_input(f"Column letter for displacement in {wid}.xlsx: ")
+                wall_cols[wid] = col
+                if config['y_type'] == 3:
+                    h = get_float_input(f"Total wall height (meters) for {wid}: ")
+                    wall_heights[wid] = h
+            config['wall_columns'] = wall_cols
+            config['wall_heights'] = wall_heights
+
+        if config['mode'] == 'selective':
+            im_list = config.get('selected_ims', [])
+            print(f"\nPreviously selected IM combinations ({len(im_list)}):")
+            for im_type, col, label in im_list:
+                print(f"  {label}")
+            if not get_yes_no_input("Keep these selections? (y/n): "):
+                config['selected_ims'] = select_ims_interactive(config['main_folder'], config['num_walls'])
+        else:
+            print("\nSweep mode will process ALL FOUR IMs (Cordova, INp, ISa, AvgSa).")
+            config['sweep_im'] = 'all'
+        save_config(config)
+    else:
+        mode = get_int_input("Enter 1 for Selective mode, 2 for Sweep mode: ")
+        config = {'mode': 'selective' if mode == 1 else 'sweep'}
+        config['main_folder'] = get_directory_path("Enter path to main folder (containing Z1, Z2, ...): ")
+        config['disp_folder'] = get_directory_path("Enter path to displacement folder: ")
+        config['num_walls'] = get_int_input("Enter number of walls: ")
+        config['drift_limit'] = get_float_input("\nMaximum drift to include (%) [3.0]: ", 3.0)
+        config['reference_drift_limit'] = get_float_input("Reference drift limit (%) [2.0]: ", 2.0)
+        print("\nY-value type:")
+        print("1. Max relative displacement / height")
+        print("2. Average relative displacement (as-is)")
+        print("3. Max relative displacement for last floor / height")
+        config['y_type'] = get_int_input("Enter choice (1,2,3): ")
+        if config['y_type'] == 1:
+            config['height'] = get_float_input("Floor/wall height (meters): ")
+            config['wall_heights'] = {}
+        elif config['y_type'] == 3:
+            config['height'] = 1.0
+            config['wall_heights'] = {}
+        else:
+            config['height'] = 1.0
+            config['wall_heights'] = {}
+        config['use_log_y'] = get_yes_no_input("Use log Y-axis? (y/n, recommended=y): ")
+        config['use_log_x'] = get_yes_no_input("Use log X-axis? (y/n, recommended=y): ")
+        wall_cols = {}
+        wall_heights = {}
+        for i in range(1, config['num_walls']+1):
+            wid = f"Z{i}"
+            col = get_column_letter_input(f"Column letter for displacement in {wid}.xlsx: ")
+            wall_cols[wid] = col
+            if config['y_type'] == 3:
+                h = get_float_input(f"Total wall height (meters) for {wid}: ")
+                wall_heights[wid] = h
+        config['wall_columns'] = wall_cols
+        config['wall_heights'] = wall_heights
+        if config['mode'] == 'selective':
+            config['selected_ims'] = select_ims_interactive(config['main_folder'], config['num_walls'])
+            if not config['selected_ims']:
+                print("No IM combinations selected. Exiting.")
+                return
+        else:
+            config['sweep_im'] = 'all'
+        save_config(config)
+
+    # Extract common variables
+    main_folder = config['main_folder']
+    disp_folder = config['disp_folder']
+    num_walls = config['num_walls']
+    drift_limit = config['drift_limit']
+    reference_drift_limit = config['reference_drift_limit']
+    y_type = config['y_type']
+    height = config.get('height', 1.0)
+    use_log_y = config['use_log_y']
+    use_log_x = config['use_log_x']
+    wall_columns = config['wall_columns']
+    wall_heights = config.get('wall_heights', {})
+
+    out_dir = get_directory_path("\nEnter output directory for results: ")
+    os.makedirs(out_dir, exist_ok=True)
+
+    if y_type == 1:
+        y_type_label = 'Maksimalni spratni drift (%)'
+    elif y_type == 2:
+        y_type_label = 'Average Relative Displacement'
+    else:
+        y_type_label = 'Drift na nivou cijelog zida (%)'
+
+    # ---- Wall display names ----
+    display_name_map = {'Z1': 'Zid 6', 'Z2': 'Zid 8', 'Z3': 'Zid 10', 'Z4': 'Zid 12', 'Z5': 'Zid 14'}
+    all_wall_ids = [f"Z{i}" for i in range(1, num_walls+1)]
+    wall_display = {wid: display_name_map.get(wid, wid) for wid in all_wall_ids}
+    all_display_names = [wall_display[wid] for wid in all_wall_ids]
+
+    # ---- Read displacement data per wall ----
+    wall_disp_data = {}
+    for wall_id in all_wall_ids:
+        print(f"\n=== Processing displacement for {wall_id} ===")
+        disp_col_letter = wall_columns.get(wall_id)
+        if not disp_col_letter:
+            print(f"  No column letter for {wall_id}. Skipping.")
+            continue
+        col_idx = ord(disp_col_letter) - ord('A')
+        disp_path = get_file_path_agnostic(disp_folder, wall_id)
+        if disp_path is None:
+            print(f"  Displacement file not found for {wall_id}. Skipping.")
+            continue
+        disp_df = pd.read_excel(disp_path, header=None)
+        if disp_df.shape[1] <= col_idx:
+            print(f"  Column {disp_col_letter} not found. Skipping.")
+            continue
+        file_names = disp_df.iloc[:, 0].astype(str).values
+        drift_raw = disp_df.iloc[:, col_idx].values
+        drift = pd.to_numeric(drift_raw, errors='coerce')
+        file_nums = [extract_number_from_filename(fn) for fn in file_names]
+        df_disp = pd.DataFrame({'FileNum': file_nums, 'Drift': drift})
+        df_disp = df_disp.dropna(subset=['FileNum', 'Drift'])
+        if y_type == 1:
+            df_disp['Drift'] = df_disp['Drift'] / height * 100.0
+        elif y_type == 3:
+            wall_h = wall_heights.get(wall_id)
+            if wall_h is None or wall_h <= 0:
+                print(f"  WARNING: No valid height for {wall_id}. Using 1.0 m.")
+                wall_h = 1.0
+            df_disp['Drift'] = df_disp['Drift'] / wall_h * 100.0
+        else:  # y_type == 2
+            df_disp['Drift'] = df_disp['Drift'] * 100.0
+        wall_disp_data[wall_id] = dict(zip(df_disp['FileNum'], df_disp['Drift']))
+        print(f"  Loaded {len(df_disp)} records for {wall_id}.")
+
+    # ---- Mode-specific processing ----
+    if config['mode'] == 'selective':
+        selected_ims = config['selected_ims']
+        walls_data = {dn: {} for dn in all_display_names}
+        summary_rows = []
+        wall_markers = {}
+        wall_line_styles = {}
+        for idx, wall_id in enumerate(all_wall_ids):
+            display_name = wall_display[wall_id]
+            wall_markers[display_name] = MARKERS[idx % len(MARKERS)]
+            wall_line_styles[display_name] = LINE_STYLES[idx % len(LINE_STYLES)]
+        print("\n" + "="*70)
+        print("SELECTIVE MODE: Processing selected IM combinations")
+        print("="*70)
+
+        filename_map = {'Cordova': 'Cordova', 'INp': 'INp', 'ISa': 'ISa', 'AvgSa': 'Avg_Sa'}
+
+        for im_type, col_name, im_label in selected_ims:
+            print(f"\n--- Processing {im_label} ---")
+            actual_filename = filename_map.get(im_type, im_type)
+            for wall_id in all_wall_ids:
+                display_name = wall_display[wall_id]
+                print(f"  Wall: {display_name} (ID: {wall_id})")
+                if wall_id not in wall_disp_data:
+                    print("    No displacement data. Skipping.")
+                    continue
+                im_file = get_file_path_agnostic(os.path.join(main_folder, wall_id), actual_filename)
+                if im_file is None:
+                    base_path = os.path.join(main_folder, wall_id, actual_filename)
+                    print(f"    IM file not found for {wall_id}. Searched:")
+                    print(f"      {base_path}.xlsx")
+                    print(f"      {base_path}.txt")
+                    continue
+                if im_file.endswith('.xlsx'):
+                    df_im = pd.read_excel(im_file)
+                else:
+                    df_im = pd.read_csv(im_file, delimiter=r'\s+')
+                if col_name not in df_im.columns:
+                    print(f"    Column {col_name} not found. Skipping.")
+                    continue
+                filename_col = df_im.columns[0]
+                df_im['FileNum'] = df_im[filename_col].apply(lambda x: extract_number_from_filename(str(x)))
+                df_im = df_im.dropna(subset=['FileNum'])
+                disp_map = wall_disp_data[wall_id]
+                merged = []
+                for _, row in df_im.iterrows():
+                    fn = row['FileNum']
+                    if fn in disp_map:
+                        merged.append({'FileNum': fn, 'IM': row[col_name]})
+                if not merged:
+                    print("    No matching records after merge. Skipping.")
+                    continue
+                merged = pd.DataFrame(merged)
+                merged['Drift'] = merged['FileNum'].map(disp_map)
+                X_full = merged['IM'].values
+                Y_full = merged['Drift'].values
+                Xf, Yf = filter_data_for_power_law(X_full, Y_full, drift_limit)
+                n_used = len(Xf)
+                n_total = len(X_full)
+                if n_used < 2:
+                    print(f"    Insufficient data ({n_used}/{n_total}) after filtering. Skipping.")
+                    continue
+                res = fit_power_law_with_stats(Xf, Yf)
+                if res[0] is None:
+                    continue
+                (a_fit, b_fit, r2_log, r2_orig, sigma, factor,
+                 se_b, se_ln_a, ci_b, ci_a,
+                 t_b0, t_b1, p_b0, p_b1,
+                 residuals_log, Y_pred_orig, n, df) = res
+                fitted_log = np.log(a_fit) + b_fit * np.log(Xf)
+                summary_rows.append({
+                    'Wall': display_name,
+                    'IM': im_label,
+                    'a': a_fit, 'b': b_fit,
+                    'R2_log': r2_log, 'R2_orig': r2_orig,
+                    'sigma': sigma, 'factor': factor,
+                    'se_b': se_b, 'se_lna': se_ln_a,
+                    'ci_b_lower': ci_b[0], 'ci_b_upper': ci_b[1],
+                    'ci_a_lower': ci_a[0], 'ci_a_upper': ci_a[1],
+                    'p_b0': p_b0, 'p_b1': p_b1,
+                    'n_used': n_used, 'n_total': n_total
+                })
+                walls_data[display_name][im_label] = {
+                    'X_filtered': Xf, 'Y_filtered': Yf,
+                    'a': a_fit, 'b': b_fit,
+                    'r2_log': r2_log, 'r2_orig': r2_orig,
+                    'sigma': sigma, 'factor': factor,
+                    'n_used': n_used, 'n_total': n_total,
+                    'residuals_log': residuals_log, 'fitted_log': fitted_log
+                }
+                create_individual_plot(display_name, im_label, Xf, Yf, a_fit, b_fit,
+                                       r2_log, r2_orig, sigma, n_total, n_used,
+                                       drift_limit, reference_drift_limit,
+                                       use_log_x, use_log_y,
+                                       wall_markers[display_name], out_dir, y_type_label)
+                create_diagnostic_plots_and_csv(display_name, im_label, residuals_log, fitted_log, out_dir)
+            create_comparative_plot(im_label, walls_data, all_display_names, wall_markers, wall_line_styles,
+                                    use_log_x, use_log_y, reference_drift_limit, y_type_label, out_dir)
+
+        if summary_rows:
+            df_summary = pd.DataFrame(summary_rows)
+            csv_path = os.path.join(out_dir, "regression_summary.csv")
+            df_summary.to_csv(csv_path, index=False)
+            print(f"\nSummary CSV saved: {csv_path}")
+
+        print("\nGenerating overall heatmaps for selective mode...")
+        all_ims = []
+        for im_type, col_name, im_label in selected_ims:
+            if im_label not in all_ims:
+                all_ims.append(im_label)
+        n_ims = len(all_ims)
+        n_walls = len(all_display_names)
+
+        r2_matrix = np.full((n_ims, n_walls), np.nan)
+        sigma_matrix = np.full((n_ims, n_walls), np.nan)
+
+        for i, im in enumerate(all_ims):
+            for j, wall in enumerate(all_display_names):
+                for row in summary_rows:
+                    if row['Wall'] == wall and row['IM'] == im:
+                        r2_matrix[i, j] = row['R2_log']
+                        sigma_matrix[i, j] = row['sigma']
+                        break
+
+        create_heatmap(r2_matrix, all_ims, all_display_names,
+                       title='R²',
+                       filename=os.path.join(out_dir, 'R2_log_heatmap_selective.png'),
+                       xlabel='Zidovi', ylabel='Mjere intenziteta',
+                       vmin=0, vmax=1, cmap='RdYlGn', annot=True, fmt='.3f')
+
+        create_heatmap(sigma_matrix, all_ims, all_display_names,
+                       title='Disperzija σ',
+                       filename=os.path.join(out_dir, 'sigma_heatmap_selective.png'),
+                       xlabel='Zidovi', ylabel='Mjere intenziteta',
+                       vmin=0, vmax=1, cmap='RdYlGn_r', annot=True, fmt='.3f')
+        print("  Selective mode heatmaps saved.")
+
+    else:
+        # ========== SWEEP MODE ==========
+        filename_map = {'Cordova': 'Cordova', 'INp': 'INp', 'ISa': 'ISa', 'AvgSa': 'Avg_Sa'}
+        print("\n" + "="*70)
+        print("SWEEP MODE: Processing ALL combinations of Cordova, INp, ISa, AvgSa")
+        print("="*70)
+
+        for sweep_im in SWEEP_IM_TYPES:
+            print(f"\n{'='*50}")
+            print(f"Processing IM: {sweep_im}")
+            print('='*50)
+            actual_filename = filename_map.get(sweep_im, sweep_im)
+            all_results = []
+
+            for wall_id in all_wall_ids:
+                display_name = wall_display[wall_id]
+                print(f"\n--- Wall: {display_name} (ID: {wall_id}) ---")
+                if wall_id not in wall_disp_data:
+                    print("  No displacement data. Skipping.")
+                    continue
+                im_file = get_file_path_agnostic(os.path.join(main_folder, wall_id), actual_filename)
+                if im_file is None:
+                    base_path = os.path.join(main_folder, wall_id, actual_filename)
+                    print(f"  IM file not found for {wall_id}. Searched:")
+                    print(f"    {base_path}.xlsx")
+                    print(f"    {base_path}.txt")
+                    continue
+                if im_file.endswith('.xlsx'):
+                    df_im = pd.read_excel(im_file)
+                else:
+                    df_im = pd.read_csv(im_file, delimiter=r'\s+')
+                params = parse_parameter_columns(sweep_im, df_im)
+                if not params:
+                    print("  No parameter columns found. Skipping.")
+                    continue
+                filename_col = df_im.columns[0]
+                df_im['FileNum'] = df_im[filename_col].apply(lambda x: extract_number_from_filename(str(x)))
+                df_im = df_im.dropna(subset=['FileNum'])
+                disp_map = wall_disp_data[wall_id]
+                merged = []
+                for _, row in df_im.iterrows():
+                    fn = row['FileNum']
+                    if fn in disp_map:
+                        merged.append({'FileNum': fn, **row.to_dict()})
+                if not merged:
+                    print("  No matching records after merge. Skipping.")
+                    continue
+                merged = pd.DataFrame(merged)
+                merged['Drift'] = merged['FileNum'].map(disp_map)
+                wall_results = []
+                for (p1, p2, col, label) in params:
+                    X_full = merged[col].values
+                    Y_full = merged['Drift'].values
+                    Xf, Yf = filter_data_for_power_law(X_full, Y_full, drift_limit)
+                    n_used = len(Xf)
+                    n_total = len(X_full)
+                    if n_used < 2:
+                        wall_results.append({
+                            'wall': display_name, 'p1': p1, 'p2': p2,
+                            'r2_log': np.nan, 'sigma': np.nan,
+                            'n_used': n_used, 'n_total': n_total
+                        })
+                        continue
+                    res = fit_power_law_with_stats(Xf, Yf)
+                    if res[0] is None:
+                        wall_results.append({
+                            'wall': display_name, 'p1': p1, 'p2': p2,
+                            'r2_log': np.nan, 'sigma': np.nan,
+                            'n_used': n_used, 'n_total': n_total
+                        })
+                        continue
+                    a_fit, b_fit, r2_log, r2_orig, sigma, factor, _, _, _, _, _, _, _, _, _, _, _, n = res
+                    wall_results.append({
+                        'wall': display_name, 'p1': p1, 'p2': p2,
+                        'r2_log': r2_log, 'sigma': sigma,
+                        'n_used': n_used, 'n_total': n_total
+                    })
+
+                    if DEBUG:
+                        logY = np.log(Yf)
+                        logX = np.log(Xf)
+                        logY_pred = np.log(a_fit) + b_fit * logX
+                        residuals = logY - logY_pred
+                        SSE = np.sum(residuals**2)
+                        SST = np.sum((logY - np.mean(logY))**2)
+                        manual_r2 = 1 - SSE/SST
+                        manual_sigma = np.sqrt(SSE / (len(Xf)-2))
+                        print(f"\nDEBUG {display_name} {label}:")
+                        print(f"  n = {len(Xf)}")
+                        print(f"  R²_log = {r2_log:.6f} (manual: {manual_r2:.6f})")
+                        print(f"  sigma  = {sigma:.6f} (manual: {manual_sigma:.6f})")
+                        print(f"  SSE = {SSE:.6f}, SST = {SST:.6f}")
+                        if abs(r2_log - manual_r2) > 1e-6 or abs(sigma - manual_sigma) > 1e-6:
+                            print("  WARNING: inconsistency between reported and manually computed values!")
+                        else:
+                            print("  Values are consistent with manual calculation.")
+
+                df_wall = pd.DataFrame(wall_results)
+                all_results.append(df_wall)
+                create_sweep_heatmaps(df_wall, display_name, sweep_im, out_dir)
+                print(f"  Heatmaps saved for {display_name}")
+
+            if all_results:
+                df_all = pd.concat(all_results, ignore_index=True)
+                csv_path = os.path.join(out_dir, f"regression_summary_{sweep_im}_sweep.csv")
+                df_all.to_csv(csv_path, index=False)
+                print(f"\nCombined CSV summary saved: {csv_path}")
+            else:
+                print(f"\nNo results generated for {sweep_im}.")
+
+    print(f"\nAll results saved to: {out_dir}")
+    print("Analysis complete.")
+
+if __name__ == "__main__":
+    main()
