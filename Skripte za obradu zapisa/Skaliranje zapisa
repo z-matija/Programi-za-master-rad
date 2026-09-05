@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""
+Cloud Ground Motion Scaling Script – Sa_avg Based
+
+Description:
+    This script scales each valid ground motion component (E, N, or both) to a
+    single target Sa_avg intensity level. Target Sa_avg values are linearly
+    spaced between user-defined IM_min and IM_max, with the number of targets
+    equal to the number of valid components. Components are sorted by original
+    Sa_avg and paired with sorted targets to minimise scaling factors.
+
+    Output structure (for each component):
+        output_root/record_id/TH/recordIDcomponent_targetIMg.txt
+        output_root/record_id/RS/recordIDcomponent_targetIMg.txt
+
+    All original header formatting and numerical precision are preserved.
+"""
+
+# --- Standard Library Imports ---
+import sys
+import shutil
+from pathlib import Path
+
+# --- Third-Party Imports ---
+import numpy as np
+import pandas as pd
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+# ----------------------------------------------------------------------
+# CONSTANTS
+# ----------------------------------------------------------------------
+G_TO_CMS2 = 980.665          # 1 g = 980.665 cm/s²
+SPECTRA_HEADER_LINES = 3     # Number of header lines in RS/*.txt
+TH_HEADER_LINES = 5          # Number of header lines in TH/*.txt
+
+# ----------------------------------------------------------------------
+# HELPER FUNCTIONS (identical to previous scripts)
+# ----------------------------------------------------------------------
+
+def read_response_spectra_with_header(filepath):
+    """Read RS file, return (headers list, data array)."""
+    headers = []
+    with open(filepath, 'r') as f:
+        for _ in range(SPECTRA_HEADER_LINES):
+            headers.append(f.readline().rstrip('\n'))
+        data = np.loadtxt(filepath, skiprows=SPECTRA_HEADER_LINES)
+    return headers, data
+
+def read_time_history_with_header(filepath):
+    """Read TH file, return (headers list, data array)."""
+    headers = []
+    with open(filepath, 'r') as f:
+        for _ in range(TH_HEADER_LINES):
+            headers.append(f.readline().rstrip('\n'))
+        data = np.loadtxt(filepath, skiprows=TH_HEADER_LINES)
+    return headers, data
+
+def write_scaled_time_history_exact(output_path, headers, time, acc_scaled, vel_scaled):
+    """Write scaled TH with exact original formatting."""
+    with open(output_path, 'w') as f:
+        for h in headers:
+            f.write(h + '\n')
+        for t, a, v in zip(time, acc_scaled, vel_scaled):
+            f.write(f"{t:11.5f}{a:16.5f}{v:16.5f}\n")
+
+def write_scaled_spectra_exact(output_path, headers, periods, sa_scaled, sv_scaled, sd_scaled):
+    """Write scaled RS with exact original formatting."""
+    with open(output_path, 'w') as f:
+        for h in headers:
+            f.write(h + '\n')
+        for p, sa, sv, sd in zip(periods, sa_scaled, sv_scaled, sd_scaled):
+            f.write(f"{p:12.5f}{sa:12.5f}{sv:12.5f}{sd:12.5f}\n")
+
+def get_geometric_mean_in_interval(periods, sa_values, t_low, t_high):
+    """Geometric mean of Sa within period interval (strict inclusion)."""
+    mask = (periods >= t_low) & (periods <= t_high)
+    if np.sum(mask) == 0:
+        return None, 0
+    sa_in_interval = sa_values[mask]
+    log_sa = np.log(np.maximum(sa_in_interval, 1e-10))
+    gm_sa = np.exp(np.mean(log_sa))
+    return gm_sa, np.sum(mask)
+
+def find_numbered_folders(main_folder):
+    """Find numeric subfolders containing TH/ and RS/."""
+    numbered = []
+    for item in Path(main_folder).iterdir():
+        if item.is_dir() and item.name.isdigit():
+            th_path = item / "TH"
+            rs_path = item / "RS"
+            if th_path.exists() and th_path.is_dir() and rs_path.exists() and rs_path.is_dir():
+                numbered.append(item.name)
+    numbered.sort(key=lambda x: int(x))
+    return numbered
+
+def interpolate_sa_at_period(periods, sa_values, target_period):
+    """Linear interpolation of Sa at a specific period."""
+    if target_period < periods[0] or target_period > periods[-1]:
+        return None
+    return np.interp(target_period, periods, sa_values)
+
+# ----------------------------------------------------------------------
+# INTERACTIVE INPUT COLLECTION
+# ----------------------------------------------------------------------
+
+def get_interactive_parameters():
+    """Prompt user for all scaling parameters."""
+    print("\n" + "=" * 70)
+    print("CLOUD GROUND MOTION SCALING – Sa_avg BASED")
+    print("=" * 70)
+
+    # 1. Main folder containing records
+    while True:
+        main_folder = input("\nPath to folder with numbered record subfolders: ").strip()
+        if not main_folder:
+            print("Please enter a valid path.")
+            continue
+        if not Path(main_folder).exists():
+            print(f"ERROR: Path '{main_folder}' does not exist.")
+            continue
+        # We don't check for valid folders here; will do later
+        break
+
+    # 2. Component choice
+    while True:
+        comp_choice = input("\nProcess which components? (both / E / N): ").strip().lower()
+        if comp_choice in ['both', 'e', 'n']:
+            break
+        print("Please enter 'both', 'E', or 'N'.")
+
+    # 3. Fundamental period T1
+    while True:
+        try:
+            T1 = float(input("\nFundamental period T1 (s): ").strip())
+            if T1 <= 0:
+                print("T1 must be positive.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a number.")
+
+    # 4. Period range factors for Sa_avg
+    while True:
+        try:
+            period_low = float(input("\nLower period factor (e.g., 0.2 for 0.2*T1) [default: 0.2]: ").strip() or "0.2")
+            if period_low <= 0:
+                print("Factor must be positive.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a number.")
+
+    while True:
+        try:
+            period_high = float(input("Upper period factor (e.g., 1.5 for 1.5*T1) [default: 1.5]: ").strip() or "1.5")
+            if period_high <= period_low:
+                print("Upper factor must be greater than lower factor.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a number.")
+
+    # 5. Target Sa_avg range (absolute values, in g)
+    while True:
+        try:
+            IM_min = float(input("\nMinimum target Sa_avg (g): ").strip())
+            if IM_min <= 0:
+                print("Minimum IM must be positive.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a number.")
+
+    while True:
+        try:
+            IM_max = float(input("Maximum target Sa_avg (g): ").strip())
+            if IM_max <= IM_min:
+                print("Maximum IM must be greater than minimum IM.")
+                continue
+            break
+        except ValueError:
+            print("Please enter a number.")
+
+    # 6. Output folder
+    output_root = input("\nOutput root folder: ").strip()
+    if not output_root:
+        output_root = "./cloud_scaled"
+        print(f"Using default: {output_root}")
+
+    # 7. Overwrite behaviour
+    force = False
+    if Path(output_root).exists():
+        answer = input(f"\nOutput folder '{output_root}' already exists. Overwrite? (y/n): ").strip().lower()
+        force = (answer == 'y')
+
+    # Display summary and confirm
+    print("\n" + "-" * 50)
+    print("SUMMARY OF PARAMETERS")
+    print("-" * 50)
+    print(f"Record folder:       {main_folder}")
+    print(f"Components:          {comp_choice}")
+    print(f"T1:                 {T1:.3f} s")
+    print(f"Sa_avg range:       {period_low}*T1 – {period_high}*T1 = [{T1*period_low:.3f}s, {T1*period_high:.3f}s]")
+    print(f"Target Sa_avg range: {IM_min:.3f}g to {IM_max:.3f}g")
+    print(f"Output folder:      {output_root}")
+    print(f"Overwrite if exists: {'Yes' if force else 'No'}")
+    print("-" * 50)
+
+    confirm = input("\nProceed with these settings? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("Operation cancelled.")
+        sys.exit(0)
+
+    return {
+        "main_folder": main_folder,
+        "comp_choice": comp_choice,
+        "T1": T1,
+        "period_low": period_low,
+        "period_high": period_high,
+        "IM_min": IM_min,
+        "IM_max": IM_max,
+        "output_root": output_root,
+        "force": force
+    }
+
+# ----------------------------------------------------------------------
+# MAIN SCALING ROUTINE
+# ----------------------------------------------------------------------
+
+def main():
+    # Get parameters interactively
+    params = get_interactive_parameters()
+
+    main_folder = params["main_folder"]
+    comp_choice = params["comp_choice"]
+    T1 = params["T1"]
+    period_low_factor = params["period_low"]
+    period_high_factor = params["period_high"]
+    IM_min_g = params["IM_min"]
+    IM_max_g = params["IM_max"]
+    output_root = Path(params["output_root"])
+    force = params["force"]
+
+    # Absolute period range for Sa_avg
+    period_low_abs = T1 * period_low_factor
+    period_high_abs = T1 * period_high_factor
+
+    print("\n" + "=" * 70)
+    print("CLOUD SCALING – PROCESSING COMPONENTS")
+    print("=" * 70)
+    print(f"T1 = {T1:.3f} s")
+    print(f"Components: {comp_choice}")
+    print(f"Sa_avg period range: [{period_low_abs:.3f}s, {period_high_abs:.3f}s]")
+    print(f"Target Sa_avg range: {IM_min_g:.3f}g to {IM_max_g:.3f}g")
+    print(f"Output root: {output_root}")
+    print("=" * 70)
+
+    # Prepare output folder
+    if output_root.exists():
+        if force:
+            shutil.rmtree(output_root)
+            print(f"\nRemoved existing output folder (--force).")
+        else:
+            print(f"\nERROR: Output folder {output_root} already exists. Use overwrite option to replace.")
+            sys.exit(1)
+    output_root.mkdir(parents=True)
+
+    # Find all numbered folders
+    record_ids = find_numbered_folders(main_folder)
+    if not record_ids:
+        print("\nERROR: No valid record folders found in", main_folder)
+        sys.exit(1)
+    print(f"\nFound {len(record_ids)} record folders with TH/RS structure.")
+
+    # Determine which components to look for
+    if comp_choice == 'both':
+        components_to_find = ['E', 'N']
+    else:
+        components_to_find = [comp_choice.upper()]
+
+    # List to store all valid components (as independent items)
+    components = []          # each element: dict with keys: record_id, comp, orig_sa_avg_cms2, orig_sa_t1_cms2, periods, sa_orig, sv_orig, sd_orig, rs_headers, th_headers, th_time, th_acc, th_vel
+    warnings = []            # collect warnings to display at end
+
+    # Pre-process each record for requested components
+    for rid in record_ids:
+        base_path = Path(main_folder) / rid
+        for comp in components_to_find:
+            # Check RS file
+            rs_path = base_path / "RS" / f"{rid}{comp}.txt"
+            if not rs_path.exists():
+                warnings.append(f"Record {rid} component {comp}: RS file missing, skipped.")
+                continue
+
+            try:
+                rs_headers, rs_data = read_response_spectra_with_header(rs_path)
+            except Exception as e:
+                warnings.append(f"Record {rid} component {comp}: Error reading RS file: {e}")
+                continue
+
+            periods = rs_data[:, 0].copy()
+            sa_orig = rs_data[:, 1].copy()
+            sv_orig = rs_data[:, 2].copy()
+            sd_orig = rs_data[:, 3].copy()
+
+            # Compute original Sa_avg
+            avg_sa, n_points = get_geometric_mean_in_interval(periods, sa_orig, period_low_abs, period_high_abs)
+            if avg_sa is None:
+                warnings.append(f"Record {rid} component {comp}: No period points in Sa_avg interval, skipped.")
+                continue
+
+            # Compute original Sa(T1) (may be NaN if out of range)
+            sa_T1 = interpolate_sa_at_period(periods, sa_orig, T1)
+            if sa_T1 is None:
+                sa_T1 = np.nan
+                warnings.append(f"Record {rid} component {comp}: T1 outside period grid, Sa(T1) set to NaN.")
+
+            # Check TH file
+            th_path = base_path / "TH" / f"{rid}{comp}.txt"
+            if not th_path.exists():
+                warnings.append(f"Record {rid} component {comp}: TH file missing, skipped.")
+                continue
+
+            try:
+                th_headers, th_data = read_time_history_with_header(th_path)
+            except Exception as e:
+                warnings.append(f"Record {rid} component {comp}: Error reading TH file: {e}")
+                continue
+
+            # Extract time, acc, vel
+            time = th_data[:, 0].copy()
+            acc = th_data[:, 1].copy()
+            vel = th_data[:, 2].copy()
+
+            # Store component data
+            components.append({
+                "record_id": rid,
+                "comp": comp,
+                "orig_sa_avg_cms2": avg_sa,
+                "orig_sa_t1_cms2": sa_T1,
+                "periods": periods,
+                "sa_orig": sa_orig,
+                "sv_orig": sv_orig,
+                "sd_orig": sd_orig,
+                "rs_headers": rs_headers,
+                "th_headers": th_headers,
+                "th_time": time,
+                "th_acc": acc,
+                "th_vel": vel
+            })
+
+    if not components:
+        print("\nERROR: No valid components found. Exiting.")
+        sys.exit(1)
+
+    print(f"\nCollected {len(components)} valid components for scaling.")
+
+    # Sort components by original Sa_avg
+    components.sort(key=lambda x: x["orig_sa_avg_cms2"])
+
+    # Generate target Sa_avg values (linearly spaced, in cm/s²)
+    target_vals_cms2 = np.linspace(IM_min_g * G_TO_CMS2, IM_max_g * G_TO_CMS2, len(components))
+
+    # Create output folder structure (we'll create per record as needed)
+    metadata = []
+    total_files_written = 0
+
+    print("\n" + "=" * 70)
+    print("SCALING PHASE")
+    print("=" * 70)
+
+    # Loop through paired components and targets
+    for idx, comp_data in enumerate(components):
+        target_cms2 = target_vals_cms2[idx]
+        rid = comp_data["record_id"]
+        comp = comp_data["comp"]
+        orig_avg = comp_data["orig_sa_avg_cms2"]
+        orig_t1 = comp_data["orig_sa_t1_cms2"]
+
+        # Compute scaling factor
+        SF = target_cms2 / orig_avg
+
+        # Prepare output paths
+        target_g = target_cms2 / G_TO_CMS2
+        im_str = f"{target_g:.3f}g"
+        out_th = output_root / rid / "TH" / f"{rid}{comp}_{im_str}.txt"
+        out_rs = output_root / rid / "RS" / f"{rid}{comp}_{im_str}.txt"
+
+        # Create directories if needed
+        out_th.parent.mkdir(parents=True, exist_ok=True)
+        out_rs.parent.mkdir(parents=True, exist_ok=True)
+
+        # Scale time history
+        acc_scaled = comp_data["th_acc"] * SF
+        vel_scaled = comp_data["th_vel"] * SF
+        write_scaled_time_history_exact(out_th, comp_data["th_headers"], comp_data["th_time"],
+                                        acc_scaled, vel_scaled)
+
+        # Scale response spectra (all three components scale by SF)
+        sa_scaled = comp_data["sa_orig"] * SF
+        sv_scaled = comp_data["sv_orig"] * SF
+        sd_scaled = comp_data["sd_orig"] * SF
+        write_scaled_spectra_exact(out_rs, comp_data["rs_headers"], comp_data["periods"],
+                                   sa_scaled, sv_scaled, sd_scaled)
+
+        # Achieved Sa_avg (should equal target)
+        achieved_avg_g = target_g
+
+        # Achieved Sa(T1) from scaled spectrum
+        sa_T1_scaled = interpolate_sa_at_period(comp_data["periods"], sa_scaled, T1)
+        if sa_T1_scaled is not None:
+            achieved_t1_g = sa_T1_scaled / G_TO_CMS2
+        else:
+            achieved_t1_g = np.nan
+
+        # Append metadata row
+        metadata.append({
+            "RecordID": rid,
+            "Component": comp,
+            "Original_Sa_avg_g": orig_avg / G_TO_CMS2,
+            "Original_Sa_T1_g": orig_t1 / G_TO_CMS2 if not np.isnan(orig_t1) else np.nan,
+            "Target_Sa_avg_g": target_g,
+            "ScalingFactor": SF,
+            "Achieved_Sa_avg_g": achieved_avg_g,
+            "Achieved_Sa_T1_g": achieved_t1_g,
+            "Scaled_TH": str(out_th.relative_to(output_root)),
+            "Scaled_RS": str(out_rs.relative_to(output_root))
+        })
+
+        total_files_written += 2  # TH and RS
+
+        # Print progress every 10 components
+        if (idx + 1) % 10 == 0 or (idx + 1) == len(components):
+            print(f"   Processed {idx+1}/{len(components)} components...")
+
+    # Write metadata CSV
+    df = pd.DataFrame(metadata)
+    csv_path = output_root / "cloud_scaling_log.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nMetadata log written to: {csv_path}")
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("SCALING COMPLETE")
+    print("=" * 70)
+    print(f"Valid components processed: {len(components)}")
+    print(f"Target Sa_avg range: {IM_min_g:.3f}g – {IM_max_g:.3f}g")
+    print(f"Total scaled files written: {total_files_written}")
+    print(f"Output root: {output_root.resolve()}")
+    print("\nWarnings / skipped items:")
+    if warnings:
+        for w in warnings:
+            print(f"  {w}")
+    else:
+        print("  None")
+    print("=" * 70)
+
+if __name__ == "__main__":
+    main()
