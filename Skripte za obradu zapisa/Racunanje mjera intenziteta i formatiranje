@@ -1,0 +1,397 @@
+"""
+Seismic Intensity Measure Calculator & Report Generator
+
+Description:
+    This script processes earthquake time history and response spectra data to
+    calculate multiple seismic intensity measures and generates comprehensive
+    reports. It reads paired time history and response spectra files from two
+    input folders, calculates 12 different intensity measures (PGA, PGV, RMS,
+    Arias Intensity, CAV, Sa(T1), Sv(T1), average spectral acceleration, VSI,
+    Housner Intensity, ASI, Cordova IM), and outputs both a machine-readable
+    text file and a formatted HTML report. Results are sorted numerically by
+    filename (nC format).
+"""
+
+# --- Standard Library Imports ---
+import os
+import glob
+import math
+import sys
+import re
+from collections import OrderedDict
+
+# --- Third-Party Imports ---
+import numpy as np
+import pandas as pd
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+def extract_number_from_filename(filename):
+    """
+    Extract numerical value from filename in nC format.
+    Returns integer for sorting, or None if extraction fails.
+    """
+    try:
+        # Remove file extension
+        base_name = os.path.splitext(filename)[0]
+        # Extract number before 'C'
+        number_part = base_name.rstrip('A')
+        return int(number_part)
+    except (ValueError, AttributeError):
+        return None
+
+def sort_results_numerically(results):
+    """
+    Sort results dictionary by numerical value in nC filenames.
+    Files that cannot be parsed are kept at the end.
+    """
+    sorted_items = []
+    failed_files = []
+    
+    # Separate items that can and cannot be parsed
+    for filename, values in results.items():
+        num_value = extract_number_from_filename(filename)
+        if num_value is not None:
+            sorted_items.append((num_value, filename, values))
+        else:
+            failed_files.append((filename, values))
+    
+    # Sort by numerical value
+    sorted_items.sort(key=lambda x: x[0])
+    
+    # Create new ordered dictionary
+    sorted_results = OrderedDict()
+    for num_value, filename, values in sorted_items:
+        sorted_results[filename] = values
+    
+    # Add failed files at the end
+    for filename, values in failed_files:
+        sorted_results[filename] = values
+    
+    return sorted_results, failed_files
+
+def clean_file_path(file_path):
+    """Remove surrounding quotes from file path"""
+    return file_path.strip().strip('\"\'')
+
+def find_nearest_period(periods, target):
+    """Find the index of the period closest to target"""
+    return np.abs(periods - target).argmin()
+
+def calculate_pga(acc):
+    """Calculate PGA from acceleration array (cm/s²)"""
+    return np.max(np.abs(acc))
+
+def calculate_pgv(vel):
+    """Calculate PGV from velocity array (cm/s)"""
+    return np.max(np.abs(vel))
+
+def calculate_arms(acc):
+    """Calculate RMS acceleration (cm/s²)"""
+    return np.sqrt(np.mean(acc**2))
+
+def calculate_ia(acc, time):
+    """Calculate Arias Intensity (cm/s)"""
+    a_squared = acc**2
+    integral = np.trapz(a_squared, time)
+    # Updated to use more precise g value: 980.665 cm/s²
+    return (math.pi / (2 * 980.665)) * integral
+
+def calculate_cav(acc, time):
+    """Calculate Cumulative Absolute Velocity (cm/s)"""
+    return np.trapz(np.abs(acc), time)
+
+def calculate_spectral_average(periods, sa_values, t_min=0.1, t_max=2.5):
+    """Calculate geometric mean of Sa in period range"""
+    mask = (periods >= t_min) & (periods <= t_max)
+    if np.sum(mask) < 1:
+        return 0.0
+    values = sa_values[mask]
+    positive_values = values[values > 0]
+    if len(positive_values) == 0:
+        return 0.0
+    return np.exp(np.mean(np.log(positive_values)))
+
+def calculate_vsi(periods, sv_values):
+    """Calculate Velocity Spectrum Intensity (cm)"""
+    mask = (periods >= 0.1) & (periods <= 2.5)
+    if np.sum(mask) < 2:
+        return 0.0
+    periods_in_range = periods[mask]
+    sv_in_range = sv_values[mask]
+    sort_idx = np.argsort(periods_in_range)
+    return np.trapz(sv_in_range[sort_idx], periods_in_range[sort_idx])
+
+def calculate_housner_intensity(periods, sa_values):
+    """Calculate Housner Intensity (cm)"""
+    mask = (periods >= 0.1) & (periods <= 2.5)
+    if np.sum(mask) < 2:
+        return 0.0
+    periods_in_range = periods[mask]
+    sa_in_range = sa_values[mask]
+    pseudo_velocity = (periods_in_range * sa_in_range) / (2 * np.pi)
+    sort_idx = np.argsort(periods_in_range)
+    return np.trapz(pseudo_velocity[sort_idx], periods_in_range[sort_idx])
+
+def calculate_asi(periods, sa_values):
+    """Calculate Acceleration Spectrum Intensity (cm/s)"""
+    mask = (periods >= 0.1) & (periods <= 0.5)
+    if np.sum(mask) < 2:
+        return 0.0
+    periods_in_range = periods[mask]
+    sa_in_range = sa_values[mask]
+    sort_idx = np.argsort(periods_in_range)
+    return np.trapz(sa_in_range[sort_idx], periods_in_range[sort_idx])
+
+def calculate_cordova_im(periods, sa_values, T1, c=2.0, alpha=0.5):
+    """Calculate Cordova Intensity Measure (cm/s²)"""
+    idx_T1 = find_nearest_period(periods, T1)
+    sa_T1 = sa_values[idx_T1]
+    if sa_T1 == 0:
+        return 0.0
+    idx_T2 = find_nearest_period(periods, c * T1)
+    sa_T2 = sa_values[idx_T2]
+    return sa_T1 * (sa_T2 / sa_T1) ** alpha
+
+def process_earthquake(th_data, sp_data, T1, c, alpha):
+    """Calculate all intensity measures for a single earthquake"""
+    # Unpack time history data
+    time, acc, vel = th_data
+    
+    # Unpack response spectra
+    periods, sa, sv, _ = sp_data
+    
+    # Calculate time-history based measures
+    results = {
+        "PGA": calculate_pga(acc),
+        "PGV": calculate_pgv(vel),
+        "ARMS": calculate_arms(acc),
+        "IA": calculate_ia(acc, time),
+        "CAV": calculate_cav(acc, time)
+    }
+    
+    # Calculate spectral-based measures
+    results["Sa_T1"] = sa[find_nearest_period(periods, T1)]
+    results["Sv_T1"] = sv[find_nearest_period(periods, T1)]
+    results["Sa_avg"] = calculate_spectral_average(periods, sa)
+    results["VSI"] = calculate_vsi(periods, sv)
+    results["HI"] = calculate_housner_intensity(periods, sa)
+    results["ASI"] = calculate_asi(periods, sa)
+    results["Cordova_IM"] = calculate_cordova_im(periods, sa, T1, c, alpha)
+    
+    return results
+
+def read_seismic_data(time_history_dir, spectra_dir):
+    """
+    Read and link time history and response spectra files
+    Returns an OrderedDict to preserve file order
+    """
+    seismic_data = OrderedDict()
+    
+    # Get and sort time history files to preserve order
+    th_files = sorted(glob.glob(os.path.join(time_history_dir, "*.txt")))
+    
+    # Read time history files in sorted order
+    for th_file in th_files:
+        try:
+            filename = os.path.basename(th_file)
+            data = np.loadtxt(th_file, skiprows=5)
+            if data.shape[1] != 3:
+                continue
+            seismic_data[filename] = {"time_history": (data[:, 0], data[:, 1], data[:, 2])}
+        except Exception:
+            continue
+    
+    # Read and link response spectra files
+    for sp_file in glob.glob(os.path.join(spectra_dir, "*.txt")):
+        try:
+            filename = os.path.basename(sp_file)
+            if filename not in seismic_data:
+                continue
+            data = np.loadtxt(sp_file, skiprows=3)
+            if data.shape[1] < 4:
+                continue
+            seismic_data[filename]["response_spectra"] = (data[:, 0], data[:, 1], data[:, 2], data[:, 3])
+        except Exception:
+            if filename in seismic_data:
+                del seismic_data[filename]
+    
+    return seismic_data
+
+def create_html_report(results, output_path):
+    """Create a beautiful HTML report from the results"""
+    # Convert to DataFrame
+    df = pd.DataFrame.from_dict(results, orient='index')
+    df.index.name = 'Filename'
+    df.reset_index(inplace=True)
+    
+    # Format column names for better readability
+    column_rename = {
+        "PGA": "PGA (cm/s²)",
+        "PGV": "PGV (cm/s)",
+        "ARMS": "RMS Accel (cm/s²)",
+        "IA": "Arias Intensity (cm/s)",
+        "CAV": "CAV (cm/s)",
+        "Sa_T1": "Sa(T1) (cm/s²)",
+        "Sv_T1": "Sv(T1) (cm/s)",
+        "Sa_avg": "Avg Sa (cm/s²)",
+        "VSI": "VSI (cm)",
+        "HI": "Housner (cm)",
+        "ASI": "ASI (cm/s)",
+        "Cordova_IM": "Cordova IM (cm/s²)"
+    }
+    df = df.rename(columns=column_rename)
+    
+    # Create styled table
+    styled_df = (
+        df.style
+        .format(precision=3, thousands="", decimal='.')
+        .set_properties(**{
+            'text-align': 'center',
+            'border': '1px solid black',
+            'padding': '5px',
+            'font-family': 'Arial, sans-serif'
+        })
+        .set_table_styles([
+            {'selector': 'th', 
+             'props': [
+                 ('background-color', '#2c3e50'),
+                 ('color', 'white'),
+                 ('font-weight', 'bold'),
+                 ('font-size', '14px'),
+                 ('text-align', 'center'),
+                 ('padding', '10px'),
+                 ('border', '1px solid black')
+             ]},
+            {'selector': 'tr:nth-child(even)', 
+             'props': [('background-color', '#f2f2f2')]},
+            {'selector': 'tr:hover', 
+             'props': [('background-color', '#ddd')]},
+            {'selector': 'caption', 
+             'props': [
+                 ('font-size', '20px'),
+                 ('font-weight', 'bold'),
+                 ('margin-bottom', '15px')
+             ]}
+        ])
+        .set_caption("Seismic Intensity Measures Report")
+        .hide(axis="index")
+    )
+    
+    # Save to HTML
+    with open(output_path, 'w') as f:
+        f.write(styled_df.to_html(escape=False, index=False))
+    
+    print(f"Created HTML report: {output_path}")
+
+def main():
+    print("="*70)
+    print("COMBINED: Seismic Intensity Measure Calculator & Reporter")
+    print("="*70)
+    print("This program processes all earthquake files in two folders and")
+    print("generates a comprehensive HTML report with all intensity measures.")
+    print("\nFile format requirements:")
+    print("1. Matching files must have identical names in both folders")
+    print("2. Time history format: 5 header rows, 3 columns (Time, Acc, Vel)")
+    print("3. Spectra format: 3 header rows, 4 columns (Period, Sa, Sv, Sd)")
+    print("4. Files should be named in nC.txt format (e.g., 1C.txt, 2C.txt, etc.)")
+    print("="*70)
+    
+    # Get folder paths
+    th_dir = clean_file_path(input("Enter path to TIME HISTORY folder: "))
+    sp_dir = clean_file_path(input("Enter path to RESPONSE SPECTRA folder: "))
+    
+    # Validate folders
+    if not os.path.isdir(th_dir):
+        print(f"Error: Time history folder not found: {th_dir}")
+        sys.exit(1)
+    if not os.path.isdir(sp_dir):
+        print(f"Error: Response spectra folder not found: {sp_dir}")
+        sys.exit(1)
+    
+    # Get analysis parameters
+    try:
+        T1 = float(input("Enter fundamental period T1 (s): "))
+        c = float(input("Enter period scaling factor c (default=2.0): ") or "2.0")
+        alpha = float(input("Enter exponent alpha (default=0.5): ") or "0.5")
+    except ValueError:
+        print("Invalid input for parameters")
+        sys.exit(1)
+    
+    # Get output directory
+    output_dir = clean_file_path(input("Enter output directory (press Enter for 'Results'): ") or "Results")
+    
+    # Read and link seismic data
+    print("\nReading and linking earthquake files...")
+    seismic_data = read_seismic_data(th_dir, sp_dir)
+    num_earthquakes = len(seismic_data)
+    print(f"Found {num_earthquakes} valid earthquake pairs")
+    
+    if num_earthquakes == 0:
+        print("No valid earthquake pairs found. Exiting.")
+        sys.exit(1)
+    
+    # Process all earthquakes
+    print("\nCalculating intensity measures...")
+    results = OrderedDict()
+    for filename, data in seismic_data.items():
+        try:
+            results[filename] = process_earthquake(
+                data["time_history"],
+                data["response_spectra"],
+                T1, c, alpha
+            )
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
+            results[filename] = None
+    
+    # Remove None results (failed processing)
+    results = {k: v for k, v in results.items() if v is not None}
+    
+    # Sort results numerically by filename
+    print("\nSorting results numerically by filename...")
+    sorted_results, failed_files = sort_results_numerically(results)
+    
+    # Create output directory if needed
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save raw data to text file (using sorted results)
+    txt_path = os.path.join(output_dir, "intensity_measures.txt")
+    print(f"\nSaving raw data to: {txt_path}")
+    with open(txt_path, "w") as f:
+        # Write header
+        header = "Filename PGA_cm/s2 PGV_cm/s ARMS_cm/s2 IA_cm/s CAV_cm/s "
+        header += "Sa_T1_cm/s2 Sv_T1_cm/s Sa_avg_cm/s2 VSI_cm HI_cm ASI_cm/s Cordova_IM_cm/s2"
+        f.write(header + "\n")
+        
+        # Write data rows (using sorted results)
+        for filename, values in sorted_results.items():
+            row = f"{filename} {values['PGA']:.3f} {values['PGV']:.3f} {values['ARMS']:.3f} "
+            row += f"{values['IA']:.3f} {values['CAV']:.3f} {values['Sa_T1']:.3f} "
+            row += f"{values['Sv_T1']:.3f} {values['Sa_avg']:.3f} {values['VSI']:.3f} "
+            row += f"{values['HI']:.3f} {values['ASI']:.3f} {values['Cordova_IM']:.3f}"
+            f.write(row + "\n")
+    
+    # Create HTML report (using sorted results)
+    html_path = os.path.join(output_dir, "intensity_measures_report.html")
+    create_html_report(sorted_results, html_path)
+    
+    print("\nProcessing complete!")
+    print("="*70)
+    print("Output files created:")
+    print(f"1. Raw data (machine-readable): {txt_path}")
+    print(f"2. HTML report (human-readable): {html_path}")
+    
+    # Show sorting summary
+    if failed_files:
+        print(f"\nNote: {len(failed_files)} files could not be sorted numerically")
+        print("These files appear at the end of the reports:")
+        for filename, _ in failed_files:
+            print(f"  - {filename}")
+    
+    print("\nOpen the HTML file in any web browser to view the formatted results")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
