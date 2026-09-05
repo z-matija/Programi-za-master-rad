@@ -1,0 +1,74 @@
+"""
+ESM Authentication Token Generator
+
+Description:
+    This script securely generates an authentication token for the European 
+    Strong-Motion (ESM) database web service. It prompts the user for their 
+    ESM credentials (username and password) and retrieves a signed token 
+    from the ESM API endpoint. The token is saved locally as 'esm_token.txt' 
+    and can be used by subsequent scripts (e.g., availability checkers) to 
+    authenticate API requests.
+
+Note:
+    Credentials are entered at runtime via secure input (getpass). No 
+    credentials are stored in the source code.
+"""
+
+# --- Standard Library Imports ---
+import getpass
+import urllib.parse
+
+# --- Third-Party Imports ---
+import requests
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+print("ESM Token Generator")
+print("=" * 40)
+
+# Get credentials
+username = input("Enter your ESM username: ").strip()
+password = getpass.getpass("Enter your ESM password: ").strip()
+
+# Construct the URL with parameters
+base_url = "https://esm-db.eu/esmws/generate-signed-message/1/"
+# The service expects parameters in the URL, NOT as basic auth
+params = {
+    'username': username,
+    'password': password
+}
+
+try:
+    print("Contacting ESM authentication service...")
+    
+    # Use GET request (not POST) with parameters in the URL
+    response = requests.get(base_url, params=params, timeout=30)
+    
+    # Check if the request was successful
+    if response.status_code == 200:
+        # The response content IS the token
+        token_content = response.content
+        
+        # Save it to a file
+        with open('esm_token.txt', 'wb') as f:
+            f.write(token_content)
+        
+        print(f"\n SUCCESS! Token saved to 'esm_token.txt'")
+        print(f"   Token size: {len(token_content)} bytes")
+        print("\nYou can now use this token file with your availability checker script.")
+        
+        # Optional: Show first 50 chars to verify it looks like a token
+        if len(token_content) > 50:
+            print(f"   Token preview: {token_content[:50].decode('utf-8', errors='ignore')}...")
+        
+    else:
+        print(f"\n Server returned error: HTTP {response.status_code}")
+        print(f"   Response: {response.text[:200]}")
+        
+except requests.exceptions.ConnectionError:
+    print("\n Connection failed. Check your internet connection.")
+except requests.exceptions.Timeout:
+    print("\n Request timed out. The server might be busy.")
+except Exception as e:
+    print(f"\n An unexpected error occurred: {e}")
