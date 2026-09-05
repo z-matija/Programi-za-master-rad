@@ -1,0 +1,282 @@
+"""
+XML Data Converter: Text to XML
+
+Description:
+    This script converts acceleration data from text files to XML format.
+    It reads text files containing time-acceleration pairs, converts acceleration
+    from cm/s² to m/s², and populates an XML template with the processed data.
+
+    Features:
+    - Extracts time steps and data points from text files
+    - Handles XML namespaces automatically
+    - Creates individual XML files for each text file
+    - Maintains data precision with 6-decimal formatting
+
+    Usage:
+    Run the script and provide paths for:
+    1. XML template file
+    2. Folder containing .txt data files
+    3. Output folder for generated XML files
+"""
+
+# --- Standard Library Imports ---
+import xml.etree.ElementTree as ET
+import os
+import re
+from pathlib import Path
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+def format_number(value):
+    """Format numbers to ensure consistent decimal representation"""
+    try:
+        num = float(value)
+        # Format to 6 decimal places, which is common in engineering software
+        return f"{num:.6f}"
+    except ValueError:
+        return value
+
+def update_xml_values(parent_element, new_values, value_base_name="value"):
+    """Update XML value elements, adding or removing as needed"""
+    # Get all existing value elements
+    existing_elements = list(parent_element)
+    
+    # Update existing elements with new values
+    for i, value_element in enumerate(existing_elements):
+        if i < len(new_values):
+            value_element.text = format_number(new_values[i])
+        else:
+            # Remove extra elements if new data has fewer values
+            parent_element.remove(value_element)
+    
+    # Add new elements if new data has more values
+    for i in range(len(existing_elements), len(new_values)):
+        new_element = ET.SubElement(parent_element, f'{value_base_name}{i}')
+        new_element.text = format_number(new_values[i])
+
+def extract_time_step(line):
+    """Extract the time step value from a line like 'Time Step: 0.01 s'"""
+    match = re.search(r'Time Step:\s*([\d.]+)\s*s', line)
+    if match:
+        return float(match.group(1))
+    return None
+
+def process_text_file(txt_file_path, xml_tree):
+    """Process a single text file and update the XML tree with its data"""
+    try:
+        # Read and process the text file
+        with open(txt_file_path, 'r') as txt_file:
+            lines = txt_file.readlines()
+        
+        # Extract time step from the third row
+        time_step = None
+        if len(lines) >= 3:
+            time_step = extract_time_step(lines[2])
+        
+        if time_step is None:
+            print(f"Warning: Could not extract time step from {txt_file_path.name}, using default 0.005")
+            time_step = 0.005
+        
+        # Skip first 6 rows and split into two lists
+        time_values = []
+        acceleration_values = []
+        
+        for line in lines[6:]:  # Skip the first 6 rows
+            parts = line.split()
+            if len(parts) >= 2:  # Ensure there are at least two columns
+                time_values.append(parts[0])
+                
+                # Convert acceleration from cm/sec² to m/sec² by dividing by 100
+                try:
+                    accel_value = float(parts[1]) / 100.0
+                    acceleration_values.append(accel_value)
+                except ValueError:
+                    print(f"Warning: Could not convert acceleration value '{parts[1]}' to float")
+                    acceleration_values.append(parts[1])
+        
+        new_data_count = len(time_values)
+        print(f"Found {new_data_count} data points in {txt_file_path.name}")
+        
+        if new_data_count == 0:
+            print(f"Warning: No data found in {txt_file_path.name} after skipping 6 rows")
+            return None
+        
+        # Get the second to last time value for Stage_End
+        second_last_time_value = time_values[-2] if len(time_values) >= 2 else time_values[-1]
+
+        # Get the root of the XML tree
+        root = xml_tree.getroot()
+        
+        # Handle XML namespaces if present
+        namespace = None
+        if '}' in root.tag:
+            namespace = {'ns': root.tag.split('}', 1)[0].strip('{')}
+        
+        # Find the Curve_0 element with namespace handling
+        if namespace:
+            curve_0 = root.find('ns:Curves/ns:Curve_0', namespace)
+        else:
+            curve_0 = root.find('Curves/Curve_0')
+        
+        if curve_0 is None:
+            print(f"Error: Could not find Curve_0 element in XML for {txt_file_path.name}")
+            return None
+
+        # Update the number of steps in Curve_0
+        if namespace:
+            no_of_steps = curve_0.find('ns:No_of_Steps', namespace)
+        else:
+            no_of_steps = curve_0.find('No_of_Steps')
+            
+        if no_of_steps is not None:
+            no_of_steps.text = str(new_data_count)
+
+        # Update time values
+        if namespace:
+            time_element = curve_0.find('ns:time', namespace)
+        else:
+            time_element = curve_0.find('time')
+            
+        if time_element is not None:
+            update_xml_values(time_element, time_values)
+
+        # Update acceleration values
+        if namespace:
+            acceleration_element = curve_0.find('ns:acceleration', namespace)
+        else:
+            acceleration_element = curve_0.find('acceleration')
+            
+        if acceleration_element is not None:
+            update_xml_values(acceleration_element, acceleration_values)
+
+        # Update Stages section
+        if namespace:
+            stages_element = root.find('ns:Stages', namespace)
+        else:
+            stages_element = root.find('Stages')
+            
+        if stages_element is not None:
+            if namespace:
+                stage_0 = stages_element.find('ns:Stage_0', namespace)
+            else:
+                stage_0 = stages_element.find('Stage_0')
+                
+            if stage_0 is not None:
+                # Update Stage_End with second to last time value
+                if namespace:
+                    stage_end = stage_0.find('ns:Stage_End', namespace)
+                else:
+                    stage_end = stage_0.find('Stage_End')
+                    
+                if stage_end is not None:
+                    stage_end.text = format_number(second_last_time_value)
+                
+                # Update Stage_DT with the extracted time step value
+                if namespace:
+                    stage_dt = stage_0.find('ns:Stage_DT', namespace)
+                else:
+                    stage_dt = stage_0.find('Stage_DT')
+                    
+                if stage_dt is not None:
+                    stage_dt.text = format_number(time_step)
+                
+                # Calculate number of steps for Stage_No_of_Steps using the extracted time step
+                try:
+                    stage_steps_count = int(round(float(second_last_time_value) / time_step))
+                except ValueError:
+                    print(f"Error: Could not convert {second_last_time_value} to float")
+                    stage_steps_count = 0
+                
+                # Update Stage_No_of_Steps
+                if namespace:
+                    stage_steps = stage_0.find('ns:Stage_No_of_Steps', namespace)
+                else:
+                    stage_steps = stage_0.find('Stage_No_of_Steps')
+                    
+                if stage_steps is not None:
+                    stage_steps.text = str(stage_steps_count)
+                    print(f"Stage_No_of_Steps set to {stage_steps_count} (calculated as {second_last_time_value} / {time_step})")
+        
+        return xml_tree
+        
+    except Exception as e:
+        print(f"Error processing {txt_file_path.name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def main():
+    # Get path to the XML template file
+    xml_file_path = Path(input("Please enter the path to your XML template file: ").strip().strip('"'))
+    
+    # Validate that the XML file exists
+    if not xml_file_path.is_file():
+        print(f"Error: XML file not found at '{xml_file_path}'")
+        return
+    
+    # Get path to the folder containing text files
+    txt_folder_path = Path(input("Please enter the path to the folder containing text files: ").strip().strip('"'))
+    
+    # Validate that the folder exists
+    if not txt_folder_path.is_dir():
+        print(f"Error: Folder not found at '{txt_folder_path}'")
+        return
+    
+    # Get path to the output folder
+    output_folder_path = Path(input("Please enter the path to the output folder for XML files: ").strip().strip('"'))
+    
+    # Create output folder if it doesn't exist
+    output_folder_path.mkdir(parents=True, exist_ok=True)
+    
+    # Get all text files in the folder
+    text_files = list(txt_folder_path.glob("*.txt"))
+    
+    if not text_files:
+        print(f"No text files found in '{txt_folder_path}'")
+        return
+    
+    print(f"Found {len(text_files)} text files to process")
+    
+    # Process each text file
+    successful_count = 0
+    for txt_file in text_files:
+        print(f"\nProcessing {txt_file.name}...")
+        
+        # Parse the original XML file for each text file
+        try:
+            tree = ET.parse(xml_file_path)
+        except ET.ParseError as e:
+            print(f"Error parsing XML file: {e}")
+            continue
+        
+        # Process the text file and update the XML tree
+        updated_tree = process_text_file(txt_file, tree)
+        
+        if updated_tree is not None:
+            # Generate output file name based on text file name
+            output_file_name = f"{txt_file.stem}.xml"
+            output_path = output_folder_path / output_file_name
+            
+            # Save the updated XML with proper formatting
+            try:
+                # Convert to string and reformat for better readability
+                xml_str = ET.tostring(updated_tree.getroot(), encoding='unicode')
+                
+                # Add XML declaration if missing
+                if not xml_str.startswith('<?xml'):
+                    xml_str = '<?xml version="1.0" encoding="UTF-8"?>\n' + xml_str
+                
+                # Write to file
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(xml_str)
+                
+                print(f"Saved updated XML to: {output_path}")
+                successful_count += 1
+            except Exception as e:
+                print(f"Error saving XML file {output_path}: {e}")
+    
+    print(f"\nProcessing complete! Successfully processed {successful_count} of {len(text_files)} files.")
+
+if __name__ == "__main__":
+    main()
