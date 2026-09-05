@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""
+Earthquake Strong Motion Duration Calculator and Record Trimmer
+
+Description:
+    This script processes multiple earthquake record files and calculates the
+    significant duration (D5-95) using the Arias Intensity method. It also trims
+    the earthquake records to focus on the significant motion period.
+
+    For each text file in a specified folder, the script:
+    1. Reads the acceleration time history data
+    2. Calculates Arias Intensity and cumulative Arias Intensity
+    3. Determines the time interval between 5% and 95% of total energy accumulation
+    4. Trims the records to the significant duration period (with one extra point before/after)
+    5. Saves results to 'Results.txt'
+    6. Creates trimmed records in "Skraceni zapisi" folder with sequential naming (1A, 2A, etc.)
+    7. Plots one example Arias Intensity curve for verification
+
+    The script expects input files in the specific format:
+    - Line 1: Earthquake record name
+    - Line 2: Empty
+    - Line 3: Time step information (e.g., "Time Step: 0.01 s")
+    - Line 4: Empty
+    - Line 5: Column headers
+    - Subsequent lines: Time, Acceleration, Velocity data (3 columns)
+
+    All calculations use acceleration in cm/s² with g = 980.665 cm/s².
+"""
+
+# --- Standard Library Imports ---
+import os
+import glob
+
+# --- Third-Party Imports ---
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ====================== (YOUR EXACT CODE STARTS HERE) ======================
+
+def read_earthquake_file(filename):
+    """
+    Read earthquake data from a text file with the specified format.
+    
+    Parameters:
+    filename (str): Path to the earthquake data file
+    
+    Returns:
+    tuple: (earthquake_name, time_step, time_array, acceleration_array, velocity_array, all_lines)
+    """
+    try:
+        with open(filename, 'r') as file:
+            lines = file.readlines()
+        
+        # Read earthquake name from first line
+        earthquake_name = lines[0].strip()
+        
+        # Read time step from third line (index 2)
+        time_step_line = lines[2].strip()
+        time_step = float(time_step_line.split(':')[1].split('s')[0].strip())
+        
+        # Find data start (skip headers and empty lines)
+        data_start = 5  # Data starts at line 5 (0-indexed)
+        
+        # Read data columns
+        time = []
+        acceleration = []
+        velocity = []
+        
+        for i in range(data_start, len(lines)):
+            line = lines[i].strip()
+            if line:  # Skip empty lines
+                parts = line.split()
+                if len(parts) >= 3:
+                    time.append(float(parts[0]))
+                    acceleration.append(float(parts[1]))
+                    velocity.append(float(parts[2]))
+        
+        return (earthquake_name, time_step, np.array(time), 
+                np.array(acceleration), np.array(velocity), lines)
+        
+    except Exception as e:
+        print(f"Error reading file {filename}: {str(e)}")
+        return None, None, None, None, None, None
+
+def calculate_significant_duration(time, acceleration, g=980.665):
+    """
+    Calculate significant duration (D5-95) using Arias Intensity method.
+    
+    Parameters:
+    time (array): Time values in seconds
+    acceleration (array): Acceleration values in cm/s²
+    g (float): Gravitational constant in cm/s²
+    
+    Returns:
+    tuple: (significant_duration, arias_intensity, normalized_cumulative_ai, t_5, t_95, idx_5, idx_95)
+    """
+    # Remove mean (detrend)
+    acceleration = acceleration - np.mean(acceleration)
+    
+    # Calculate Arias Intensity
+    dt = time[1] - time[0]  # Time step
+    a_squared = acceleration ** 2
+    arias_intensity = (np.pi / (2 * g)) * np.cumsum(a_squared) * dt
+    
+    # Total Arias Intensity
+    total_ai = arias_intensity[-1]
+    
+    # Normalized cumulative Arias Intensity
+    normalized_cumulative_ai = arias_intensity / total_ai
+    
+    # Find indices where cumulative AI crosses 5% and 95%
+    idx_5 = np.where(normalized_cumulative_ai >= 0.05)[0]
+    idx_95 = np.where(normalized_cumulative_ai >= 0.95)[0]
+    
+    if len(idx_5) > 0 and len(idx_95) > 0:
+        t_5 = time[idx_5[0]]
+        t_95 = time[idx_95[0]]
+        significant_duration = t_95 - t_5
+        return significant_duration, arias_intensity, normalized_cumulative_ai, t_5, t_95, idx_5[0], idx_95[0]
+    else:
+        return 0, arias_intensity, normalized_cumulative_ai, 0, 0, 0, 0
+
+def plot_example_curve(earthquake_name, time, normalized_cumulative_ai, t_5, t_95, significant_duration):
+    """
+    Plot the cumulative Arias Intensity curve for one example.
+    
+    Parameters:
+    earthquake_name (str): Name of the earthquake record
+    time (array): Time values
+    normalized_cumulative_ai (array): Normalized cumulative Arias Intensity
+    t_5 (float): Time at 5% Arias Intensity
+    t_95 (float): Time at 95% Arias Intensity
+    significant_duration (float): D5-95 duration
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(time, normalized_cumulative_ai, 'b-', linewidth=2, label='Cumulative Arias Intensity')
+    plt.axhline(y=0.05, color='r', linestyle='--', alpha=0.7, label='5% Threshold')
+    plt.axhline(y=0.95, color='g', linestyle='--', alpha=0.7, label='95% Threshold')
+    plt.axvline(x=t_5, color='r', linestyle=':', alpha=0.7)
+    plt.axvline(x=t_95, color='g', linestyle=':', alpha=0.7)
+    
+    plt.fill_between(time, 0, normalized_cumulative_ai, where=(time >= t_5) & (time <= t_95), 
+                     alpha=0.3, color='yellow', label='Significant Duration')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Normalized Cumulative Arias Intensity')
+    plt.title(f'Arias Intensity - {earthquake_name}\nSignificant Duration (D5-95): {significant_duration:.3f} s')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.ylim(0, 1)
+    plt.tight_layout()
+    plt.show()
+
+def create_trimmed_record(original_lines, time, acceleration, velocity, idx_5, idx_95, output_filename):
+    """
+    Create a trimmed earthquake record file with data between idx_5 and idx_95.
+    
+    Parameters:
+    original_lines (list): All lines from the original file
+    time (array): Time values
+    acceleration (array): Acceleration values
+    velocity (array): Velocity values
+    idx_5 (int): Start index for trimming
+    idx_95 (int): End index for trimming
+    output_filename (str): Path for the output file
+    """
+    try:
+        # Calculate indices with one extra point before and after
+        start_idx = max(0, idx_5 - 1)
+        end_idx = min(len(time) - 1, idx_95 + 1)
+        
+        # Get header lines (first 5 lines)
+        header_lines = original_lines[:5]
+        
+        # Create new file
+        with open(output_filename, 'w') as f:
+            # Write original headers
+            for line in header_lines:
+                f.write(line)
+            
+            # Write trimmed data with adjusted time starting from 0
+            time_offset = time[start_idx]
+            for i in range(start_idx, end_idx + 1):
+                adjusted_time = time[i] - time_offset
+                f.write(f"{adjusted_time:12.5f} {acceleration[i]:15.5f} {velocity[i]:15.5f}\n")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  Error creating trimmed record: {str(e)}")
+        return False
+
+def main():
+    """Main function to process all earthquake files in a folder."""
+    
+    # Get folder path from user
+    folder_path = input("Enter the path to the folder containing earthquake data files: ").strip()
+    
+    # Get naming scheme from user
+    naming_scheme = input("Enter naming scheme (A or C): ").strip().upper()
+    while naming_scheme not in ['A', 'C']:
+        print("Please enter either 'A' or 'C'")
+        naming_scheme = input("Enter naming scheme (A or C): ").strip().upper()
+    
+    # Find all text files in the folder
+    file_pattern = os.path.join(folder_path, "*.txt")
+    earthquake_files = glob.glob(file_pattern)
+    
+    if not earthquake_files:
+        print(f"No text files found in {folder_path}")
+        return
+    
+    print(f"Found {len(earthquake_files)} earthquake data files")
+    
+    # Create output directory for trimmed records
+    output_dir = os.path.join(folder_path, "Skraceni zapisi")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    results = []
+    trimmed_files = []
+    failed_files = []
+    example_plotted = False
+    file_counter = 1
+    
+    # Process each file
+    for i, file_path in enumerate(earthquake_files):
+        print(f"Processing file {i+1}/{len(earthquake_files)}: {os.path.basename(file_path)}")
+        
+        # Read earthquake data
+        (earthquake_name, time_step, time, acceleration, 
+         velocity, all_lines) = read_earthquake_file(file_path)
+        
+        if time is None or acceleration is None:
+            print(f"  Skipped due to read error")
+            failed_files.append((os.path.basename(file_path), "File read error"))
+            continue
+        
+        # Calculate significant duration
+        (significant_duration, arias_intensity, normalized_cumulative_ai, 
+         t_5, t_95, idx_5, idx_95) = calculate_significant_duration(time, acceleration)
+        
+        if significant_duration <= 0:
+            print(f"  Could not calculate significant duration")
+            failed_files.append((os.path.basename(file_path), "Duration calculation failed"))
+            continue
+        
+        # Store results
+        results.append({
+            'filename': os.path.basename(file_path),
+            'earthquake_name': earthquake_name,
+            'duration': significant_duration,
+            't_5': t_5,
+            't_95': t_95,
+            'total_arias_intensity': arias_intensity[-1] if len(arias_intensity) > 0 else 0
+        })
+        
+        print(f"  Significant Duration (D5-95): {significant_duration:.3f} s")
+        
+        # Create trimmed record
+        output_filename = os.path.join(output_dir, f"{file_counter}{naming_scheme}.txt")
+        success = create_trimmed_record(all_lines, time, acceleration, velocity, idx_5, idx_95, output_filename)
+        
+        if success:
+            print(f"  Created trimmed record: {os.path.basename(output_filename)}")
+            trimmed_files.append(os.path.basename(output_filename))
+            file_counter += 1
+        else:
+            print(f"  Failed to create trimmed record")
+            failed_files.append((os.path.basename(file_path), "Trimmed record creation failed"))
+        
+        # Plot first successful file as example
+        if not example_plotted and significant_duration > 0:
+            print(f"  Plotting example curve for {earthquake_name}")
+            plot_example_curve(earthquake_name, time, normalized_cumulative_ai, t_5, t_95, significant_duration)
+            example_plotted = True
+    
+    # Save results to file
+    output_file = os.path.join(folder_path, "Results.txt")
+    try:
+        with open(output_file, 'w') as f:
+            f.write("Earthquake Strong Motion Duration Results\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"{'Filename':<30} {'Earthquake Name':<30} {'D5-95 (s)':<10} {'t_5 (s)':<10} {'t_95 (s)':<10} {'Total AI':<15}\n")
+            f.write("-" * 110 + "\n")
+            
+            for result in results:
+                f.write(f"{result['filename']:<30} {result['earthquake_name']:<30} "
+                       f"{result['duration']:<10.3f} {result['t_5']:<10.3f} {result['t_95']:<10.3f} "
+                       f"{result['total_arias_intensity']:<15.3f}\n")
+            
+            # Add summary section
+            f.write("\n" + "=" * 50 + "\n")
+            f.write("PROCESSING SUMMARY\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Total files processed: {len(earthquake_files)}\n")
+            f.write(f"Successfully processed: {len(results)}\n")
+            f.write(f"Trimmed records created: {len(trimmed_files)}\n")
+            f.write(f"Files that failed: {len(failed_files)}\n")
+            
+            if failed_files:
+                f.write("\nFailed files and reasons:\n")
+                for filename, reason in failed_files:
+                    f.write(f"  {filename}: {reason}\n")
+            
+            if trimmed_files:
+                f.write(f"\nTrimmed records ({naming_scheme} series):\n")
+                for trimmed_file in trimmed_files:
+                    f.write(f"  {trimmed_file}\n")
+        
+        print(f"\nResults saved to: {output_file}")
+        print(f"Trimmed records saved to: {output_dir}")
+        print(f"\nSUMMARY:")
+        print(f"  Total files processed: {len(earthquake_files)}")
+        print(f"  Successfully processed: {len(results)}")
+        print(f"  Trimmed records created: {len(trimmed_files)}")
+        print(f"  Files that failed: {len(failed_files)}")
+        
+        if failed_files:
+            print(f"\nFailed files:")
+            for filename, reason in failed_files:
+                print(f"  {filename}: {reason}")
+                
+    except Exception as e:
+        print(f"Error saving results: {str(e)}")
+
+if __name__ == "__main__":
+    main()
